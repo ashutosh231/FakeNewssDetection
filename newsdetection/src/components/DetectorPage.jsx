@@ -2,74 +2,10 @@ import { useState, useRef, useEffect } from 'react'
 import Navbar from './Navbar'
 import Cursor from './Cursor'
 
-const NVIDIA_API_KEY = import.meta.env.VITE_NVIDIA_API_KEY
-
-async function generateRealAnalysis(text) {
-  try {
-    const url = "/api/nvidia/v1/chat/completions"
-    
-    const prompt = `You are VERITAS, an elite AI misinformation detection engine. Analyze the following text or claim for misinformation, factual accuracy, sensationalism, and bias.
-    Text: "${text}"
-    
-    Return ONLY a raw JSON object (no markdown, no formatting) with this exact structure:
-    {
-      "score": <number 0-100 representing credibility>,
-      "verdict": "<VERIFIED, MIXED SIGNALS, or HIGHLY SUSPICIOUS>",
-      "summary": "<2-3 sentences explaining the analysis reasoning>",
-      "flags": ["<array of 1-3 short strings like 'Sensationalist language', 'Missing context', or 'None detected'>"]
-    }`
-
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${NVIDIA_API_KEY}`
-      },
-      body: JSON.stringify({
-        model: "meta/llama-3.1-70b-instruct",
-        messages: [{ role: "user", content: prompt }],
-        max_tokens: 500,
-        temperature: 0.2
-      })
-    })
-    
-    const data = await res.json()
-    let textResponse = data.choices[0].message.content
-    // Extract JSON if model wraps it in markdown
-    const jsonMatch = textResponse.match(/\{[\s\S]*\}/)
-    if (jsonMatch) textResponse = jsonMatch[0]
-    
-    const parsed = JSON.parse(textResponse)
-
-    let ratingClass = 'text-yellow-600 bg-yellow-100'
-    if (parsed.verdict === 'HIGHLY SUSPICIOUS') ratingClass = 'text-red-600 bg-red-100'
-    if (parsed.verdict === 'VERIFIED') ratingClass = 'text-green-600 bg-green-100'
-
-    return `[ANALYSIS COMPLETE]
-    
-TARGET: "${text}"
-CREDIBILITY SCORE: <span class="text-2xl">${parsed.score}%</span>
-
-<div class="mt-4 mb-4 p-4 border-2 border-[#09090B] bg-white rounded-xl hard-shadow-sm">
-  <div class="text-[10px] font-mono mb-1 text-[#09090B]/60">VERDICT:</div>
-  <div class="font-bold uppercase tracking-wider px-2 py-1 inline-block border border-[#09090B] ${ratingClass} text-xs mb-3">
-    ${parsed.verdict}
-  </div>
-  <div class="text-sm font-medium leading-relaxed mb-3">
-    ${parsed.summary}
-  </div>
-  <div class="border-t border-[#09090B]/10 pt-2">
-    <span class="text-[10px] font-mono text-[#09090B]/60">DETECTED FLAGS:</span>
-    <ul class="list-disc list-inside text-xs font-bold mt-1">
-      ${parsed.flags.map(f => `<li>${f}</li>`).join('')}
-    </ul>
-  </div>
-</div>
-`
-  } catch (err) {
-    return `⚠️ [ERROR] VERITAS AI encountered a neural network fault: ${err.message}`
-  }
-}
+import { analyzeNews } from '../services/huggingface'
+import { saveScanResult } from '../services/api'
+import { useAuth } from '../context/AuthContext'
+import UpgradeModal from './UpgradeModal'
 
 export default function DetectorPage() {
   const [messages, setMessages] = useState([
@@ -81,7 +17,9 @@ export default function DetectorPage() {
   ])
   const [input, setInput] = useState('')
   const [isScanning, setIsScanning] = useState(false)
+  const [showUpgradeModal, setShowUpgradeModal] = useState(false)
   const chatEndRef = useRef(null)
+  const { user, refreshUser } = useAuth()
 
   const scrollToBottom = () => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -95,6 +33,11 @@ export default function DetectorPage() {
     e.preventDefault()
     if (!input.trim()) return
 
+    if (user?.subscriptionPlan === 'free' && (user?.freeScansUsed || 0) >= 2) {
+      setShowUpgradeModal(true);
+      return;
+    }
+
     const userMsg = { id: Date.now(), role: 'user', text: input.trim() }
     setMessages(prev => [...prev, userMsg])
     setInput('')
@@ -102,9 +45,20 @@ export default function DetectorPage() {
 
     // Real AI Fact Check API Call
     setTimeout(async () => {
-      const aiResponse = await generateRealAnalysis(userMsg.text)
+      const { html, raw } = await analyzeNews(userMsg.text)
       setIsScanning(false)
-      setMessages(prev => [...prev, { id: Date.now() + 1, role: 'ai', text: aiResponse }])
+      setMessages(prev => [...prev, { id: Date.now() + 1, role: 'ai', text: html }])
+
+      if (user && raw) {
+        saveScanResult({
+          content: userMsg.text,
+          inputType: 'text',
+          credibilityScore: raw.credibilityScore,
+          riskLevel: raw.riskLevel,
+          verdict: raw.verdict,
+          flags: raw.flags
+        }).then(() => refreshUser()).catch(console.error)
+      }
     }, 500)
   }
 
@@ -204,6 +158,8 @@ export default function DetectorPage() {
           </div>
         </main>
       </div>
+      
+      <UpgradeModal isOpen={showUpgradeModal} onClose={() => setShowUpgradeModal(false)} />
     </>
   )
 }

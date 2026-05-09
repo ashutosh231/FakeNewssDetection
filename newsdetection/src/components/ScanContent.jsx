@@ -1,13 +1,19 @@
 import { useState, useEffect, useRef } from 'react'
 import Navbar from './Navbar'
 import Cursor from './Cursor'
+import { analyzeNewsRaw } from '../services/huggingface'
+import { extractTextFromImage } from '../services/ocr'
+import { cleanOCRText } from '../utils/cleanOCRText'
+import { saveScanResult } from '../services/api'
+import { useAuth } from '../context/AuthContext'
+import UpgradeModal from './UpgradeModal'
 
-const NVIDIA_API_KEY = import.meta.env.VITE_NVIDIA_API_KEY
 const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY
-const VISION_API_KEY = import.meta.env.VITE_VISION_API_KEY
 
 export default function ScanContent() {
+  const { user, refreshUser } = useAuth()
   const [activeTab, setActiveTab] = useState('camera')
+  const [showUpgradeModal, setShowUpgradeModal] = useState(false)
   const [inputText, setInputText] = useState('')
   const [inputUrl, setInputUrl] = useState('')
   const [fileContent, setFileContent] = useState('')
@@ -33,6 +39,33 @@ export default function ScanContent() {
     const file = e.target.files[0]
     if (!file) return
     setFileName(file.name)
+    
+    if (file.type.startsWith('image/')) {
+      const dataUrl = URL.createObjectURL(file)
+      setCapturedImage(dataUrl)
+      setOcrProgress(0)
+      setIsExtracting(true)
+      setFileContent('SCANNING IMAGE...\nOCR Progress: 0%')
+      
+      try {
+        const { text, confidence } = await extractTextFromImage(file, (progress) => {
+          setOcrProgress(progress)
+          setFileContent(`SCANNING IMAGE...\nOCR Progress: ${progress}%`)
+        })
+        const cleaned = cleanOCRText(text)
+        if (!cleaned) throw new Error("Empty extraction")
+        
+        setFileContent(cleaned)
+        setOcrText(cleaned)
+        setIsExtracting(false)
+      } catch (err) {
+        setFileContent('Unable to clearly extract text from image. Please upload a clearer screenshot.')
+        setIsExtracting(false)
+      }
+      return;
+    }
+
+    setCapturedImage(null)
     setFileContent('Extracting text...')
     
     try {
@@ -100,80 +133,88 @@ export default function ScanContent() {
   const retakePhoto = () => { setCapturedImage(null); setOcrText(''); startCamera() }
   useEffect(() => { if (activeTab !== 'camera') stopCamera(); return () => stopCamera() }, [activeTab])
 
-  // ── SINGLE-CALL GEMINI VISION: Image → Full Analysis ──
+  // ── LOCAL OCR + HUGGING FACE PIPELINE: Image → Full Analysis ──
   const analyzeImageDirectly = async (imgDataUrl) => {
+    if (user?.subscriptionPlan === 'free' && (user?.freeScansUsed || 0) >= 2) {
+      setShowUpgradeModal(true);
+      setCapturedImage(null); startCamera(); return;
+    }
+
     setIsScanning(true); setResult(null); setProgress(0)
     const progInterval = setInterval(() => {
-      setProgress(p => p >= 95 ? 95 : p + Math.floor(Math.random() * 12))
+      setProgress(p => p >= 40 ? 40 : p + Math.floor(Math.random() * 5))
     }, 500)
 
     try {
-      const base64Data = imgDataUrl.split(',')[1]
-      const mimeType = imgDataUrl.split(';')[0].split(':')[1]
+      // 1. OCR Extraction (Tesseract.js)
+      const { text } = await extractTextFromImage(imgDataUrl)
+      const cleanedText = cleanOCRText(text)
 
-      const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{
-              parts: [
-                { inline_data: { mime_type: mimeType, data: base64Data } },
-                { text: `You are VERITAS, an elite AI misinformation detection engine with vision capabilities.
+      if (!cleanedText) throw new Error("No readable text found in image")
+      setOcrText(cleanedText)
+      
+      clearInterval(progInterval)
+      const progInterval2 = setInterval(() => {
+        setProgress(p => p >= 95 ? 95 : p + Math.floor(Math.random() * 10))
+      }, 400)
 
-Tasks:
-1. Extract ALL visible text from this image
-2. Identify factual claims in the text
-3. Detect emotionally manipulative language
-4. Analyze visual context (memes, edited screenshots, misleading formatting)
-5. Flag possible misinformation
+      // 2. Multi-Model NLP Pipeline (Hugging Face)
+      const pipelineResult = await analyzeNewsRaw(cleanedText.substring(0, 4000))
+      
+      const parsed = {
+        score: pipelineResult?.credibilityScore ?? 0,
+        sourceTrust: pipelineResult?.layerBreakdown?.source?.score ?? 0,
+        factualAccuracy: pipelineResult?.layerBreakdown?.classifier?.score ?? 0,
+        bias: pipelineResult?.manipulationLevel === 'High' ? 'High' : pipelineResult?.manipulationLevel === 'Moderate' ? 'Medium' : 'Low',
+        manipulation: (pipelineResult?.manipulationLevel || '').toLowerCase() === 'high' || (pipelineResult?.manipulationLevel || '').toLowerCase() === 'moderate',
+        summary: pipelineResult?.explanation || 'No explanation available.',
+        flags: pipelineResult?.flags || [],
+        isImage: true,
+        extractedText: cleanedText.substring(0, 4000),
+      }
 
-Return ONLY a raw JSON object (no markdown, no backticks) with this exact structure:
-{
-  "extracted_text": "<all text found in the image>",
-  "score": <number 0-100 representing overall credibility>,
-  "sourceTrust": <number 0-100>,
-  "factualAccuracy": <number 0-100>,
-  "bias": "<Low, Medium, or High>",
-  "manipulation": <boolean true if manipulation detected>,
-  "summary": "<2-4 sentences explaining the analysis including visual context>",
-  "flags": ["<array of 1-4 short flags like 'Emotional Language', 'Edited Screenshot', 'Missing Sources'>"]
-}` }
-              ]
-            }]
-          })
-        }
-      )
+      clearInterval(progInterval2)
+      setProgress(100)
 
-      const data = await res.json()
-      let textResponse = data?.candidates?.[0]?.content?.parts?.[0]?.text || ''
-      const jsonMatch = textResponse.match(/\{[\s\S]*\}/)
-      if (jsonMatch) textResponse = jsonMatch[0]
+      if (user) {
+        saveScanResult({
+          content: parsed.extractedText,
+          inputType: 'image',
+          credibilityScore: parsed.score,
+          riskLevel: parsed.bias,
+          verdict: parsed.score >= 70 ? 'True' : parsed.score >= 40 ? 'Misleading' : 'Fake',
+          flags: parsed.flags
+        }).then(() => refreshUser()).catch(console.error)
+      }
 
-      const parsed = JSON.parse(textResponse)
-      if (parsed.extracted_text) setOcrText(parsed.extracted_text)
-      clearInterval(progInterval); setProgress(100)
       setTimeout(() => { setIsScanning(false); setResult(parsed) }, 500)
 
     } catch (err) {
-      console.error('Gemini Vision analysis failed:', err)
-      clearInterval(progInterval); setProgress(100)
+      console.error('Image analysis failed:', err)
+      clearInterval(progInterval)
+      setProgress(100)
       setTimeout(() => {
         setIsScanning(false)
         setResult({ score: 0, sourceTrust: 0, factualAccuracy: 0, bias: 'High', manipulation: true,
-          summary: 'Vision analysis failed. This may be due to API rate limits — please wait 30 seconds and try again.',
+          summary: err.message === "No readable text found in image" 
+            ? 'No readable text was found in the captured image. Please try again with a clearer photo.' 
+            : 'Image analysis failed to process. Ensure your API keys and network connections are active.',
           flags: ['Analysis Failed'] })
       }, 500)
     }
   }
 
-  // ── TEXT-BASED ANALYSIS (for file/URL tabs) ──
+  // ── TEXT-BASED ANALYSIS (for file/URL tabs) — Multi-Model Pipeline ──
   const runAnalysis = async () => {
     let contentToAnalyze = ''
     if (activeTab === 'file') contentToAnalyze = fileContent
     if (activeTab === 'url') contentToAnalyze = `Analyze the content of this URL: ${inputUrl}` 
     if (!contentToAnalyze.trim() || contentToAnalyze.startsWith('Extracting')) return
+
+    if (user?.subscriptionPlan === 'free' && (user?.freeScansUsed || 0) >= 2) {
+      setShowUpgradeModal(true);
+      return;
+    }
 
     setIsScanning(true); setResult(null); setProgress(0)
     const progInterval = setInterval(() => {
@@ -181,39 +222,35 @@ Return ONLY a raw JSON object (no markdown, no backticks) with this exact struct
     }, 400)
 
     try {
-      const prompt = `You are VERITAS, an elite AI misinformation detection engine. Analyze the following content:
-      "${contentToAnalyze.substring(0, 4000)}"
-      
-      Return ONLY a raw JSON object (no markdown) with this exact structure:
-      {
-        "score": <number 0-100 representing credibility>,
-        "sourceTrust": <number 0-100>,
-        "factualAccuracy": <number 0-100>,
-        "bias": "<Low, Medium, or High>",
-        "manipulation": <boolean true if detected, false if not>,
-        "summary": "<2-4 sentences explaining the analysis>",
-        "flags": ["<array of 1-4 short string tags like 'Emotional Language', 'Missing Sources'>"]
-      }`
+      const pipelineResult = await analyzeNewsRaw(contentToAnalyze.substring(0, 4000))
 
-      const res = await fetch("/api/nvidia/v1/chat/completions", {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${NVIDIA_API_KEY}` },
-        body: JSON.stringify({
-          model: "meta/llama-3.1-70b-instruct",
-          messages: [{ role: "user", content: prompt }],
-          max_tokens: 600, temperature: 0.1
-        })
-      })
-      
-      const data = await res.json()
-      let textResponse = data.choices[0].message.content
-      const jsonMatch = textResponse.match(/\{[\s\S]*\}/)
-      if (jsonMatch) textResponse = jsonMatch[0]
-      
-      const parsed = JSON.parse(textResponse)
+      // Map orchestrator output to the ScanContent result shape
+      const parsed = {
+        score: pipelineResult?.credibilityScore ?? 0,
+        sourceTrust: pipelineResult?.layerBreakdown?.source?.score ?? 0,
+        factualAccuracy: pipelineResult?.layerBreakdown?.classifier?.score ?? 0,
+        bias: pipelineResult?.manipulationLevel === 'High' ? 'High' : pipelineResult?.manipulationLevel === 'Moderate' ? 'Medium' : 'Low',
+        manipulation: (pipelineResult?.manipulationLevel || '').toLowerCase() === 'high' || (pipelineResult?.manipulationLevel || '').toLowerCase() === 'moderate',
+        summary: pipelineResult?.explanation || 'No explanation available.',
+        flags: pipelineResult?.flags || [],
+        isImage: activeTab === 'file' && !!capturedImage,
+        extractedText: contentToAnalyze.substring(0, 4000),
+      }
+
       clearInterval(progInterval)
       setProgress(100)
       
+      if (user) {
+        saveScanResult({
+          content: parsed.extractedText,
+          inputType: activeTab,
+          credibilityScore: parsed.score,
+          riskLevel: parsed.bias,
+          verdict: parsed.score >= 70 ? 'True' : parsed.score >= 40 ? 'Misleading' : 'Fake',
+          flags: parsed.flags
+        }).then(() => refreshUser()).catch(console.error)
+      }
+
       setTimeout(() => {
         setIsScanning(false)
         setResult(parsed)
@@ -339,14 +376,37 @@ Return ONLY a raw JSON object (no markdown, no backticks) with this exact struct
                 )}
                 {activeTab === 'file' && (
                   <div className="flex-1 w-full border-2 border-dashed border-white/20 rounded-xl flex flex-col items-center justify-center p-8 min-h-[300px] hover:border-[#C8FF00]/50 transition-colors bg-[#09090B] relative group">
-                     <input type="file" accept=".txt,.pdf,.docx" onChange={handleFileChange} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" />
+                     <input type="file" accept=".txt,.pdf,.docx,.jpg,.jpeg,.png" onChange={handleFileChange} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" />
                      <iconify-icon icon="lucide:file-up" class="text-4xl text-[#C8FF00] mb-4 group-hover:-translate-y-2 transition-transform" />
                      <p className="font-bold mb-2">Drag & Drop or Click</p>
-                     <p className="font-mono text-xs text-white/50">Supports .PDF, .DOCX, .TXT</p>
+                     <p className="font-mono text-xs text-white/50">Supports JPG, PNG, PDF, DOCX, TXT</p>
                      {fileName && (
-                       <div className="mt-6 text-[#C8FF00] font-mono text-xs p-3 bg-[#C8FF00]/10 rounded border border-[#C8FF00]/30 text-center">
-                         File selected: <br/><strong>{fileName}</strong>
-                         {fileContent.startsWith('Extracting') && <div className="mt-2 text-white/50 flex items-center justify-center gap-2"><iconify-icon icon="lucide:loader" class="animate-spin" /> Extracting text...</div>}
+                       <div className="mt-6 text-[#C8FF00] font-mono text-xs p-3 bg-[#C8FF00]/10 rounded border border-[#C8FF00]/30 text-center z-10 w-full overflow-hidden">
+                         File selected: <br/><strong className="truncate block mt-1">{fileName}</strong>
+                         {isExtracting && (
+                           <div className="mt-3 text-white/90 flex flex-col items-center justify-center gap-2">
+                             <div className="flex items-center gap-2 text-[#C8FF00]">
+                               <iconify-icon icon="lucide:scan" class="animate-pulse" /> SCANNING IMAGE...
+                             </div>
+                             <div className="w-full max-w-[150px] h-1 bg-white/20 rounded overflow-hidden">
+                               <div className="h-full bg-[#C8FF00] transition-all duration-300" style={{ width: `${ocrProgress}%` }} />
+                             </div>
+                             <span className="text-[10px] opacity-70">OCR Progress: {ocrProgress}%</span>
+                           </div>
+                         )}
+                         {capturedImage && !isExtracting && (
+                           <div className="mt-3 text-white flex flex-col items-center gap-2">
+                             <span className="bg-green-500/20 text-green-400 px-2 py-0.5 rounded border border-green-500/30 text-[9px] uppercase tracking-wider flex items-center gap-1">
+                               <iconify-icon icon="lucide:check-circle-2" /> Text extracted successfully
+                             </span>
+                             <button onClick={(e) => { e.preventDefault(); setFileName(''); setFileContent(''); setCapturedImage(null); }} className="mt-2 text-red-400 hover:text-red-300 underline decoration-red-400/30 text-[10px]">Remove Image</button>
+                           </div>
+                         )}
+                       </div>
+                     )}
+                     {capturedImage && (
+                       <div className="absolute inset-0 rounded-xl overflow-hidden pointer-events-none opacity-20 group-hover:opacity-10 transition-opacity">
+                         <img src={capturedImage} className="w-full h-full object-cover blur-sm" alt="Preview" />
                        </div>
                      )}
                   </div>
@@ -540,6 +600,16 @@ Return ONLY a raw JSON object (no markdown, no backticks) with this exact struct
                         Analysis Complete
                       </div>
                       <h2 className="font-display text-3xl mt-2">CREDIBILITY REPORT</h2>
+                      {result.isImage && (
+                        <div className="flex gap-2 mt-2">
+                          <span className="bg-[#C8FF00]/20 text-[#C8FF00] border border-[#C8FF00]/50 font-mono text-[9px] uppercase tracking-widest px-2 py-0.5 rounded flex items-center gap-1">
+                            <iconify-icon icon="lucide:image" /> IMAGE ANALYSIS
+                          </span>
+                          <span className="bg-white/10 text-white/70 border border-white/20 font-mono text-[9px] uppercase tracking-widest px-2 py-0.5 rounded flex items-center gap-1">
+                            <iconify-icon icon="lucide:text-cursor-input" /> OCR EXTRACTED
+                          </span>
+                        </div>
+                      )}
                     </div>
                     
                     {/* Animated Circular Gauge */}
@@ -608,6 +678,18 @@ Return ONLY a raw JSON object (no markdown, no backticks) with this exact struct
                     <p className="text-sm leading-relaxed text-white/90">{result.summary}</p>
                   </div>
 
+                  {result.isImage && result.extractedText && (
+                    <div className="bg-[#09090B] p-5 rounded-xl border border-white/5 mb-6 relative z-10">
+                      <div className="font-mono text-[10px] uppercase text-white/50 mb-2 flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <iconify-icon icon="lucide:file-text" class="text-sm" /> EXTRACTED TEXT PREVIEW
+                        </div>
+                        <span className="text-green-400 font-bold bg-green-500/10 px-2 py-0.5 rounded border border-green-500/20">OCR Confidence: High</span>
+                      </div>
+                      <p className="text-xs leading-relaxed text-white/70 font-mono bg-white/5 p-3 rounded border border-white/10 max-h-32 overflow-y-auto whitespace-pre-wrap">{result.extractedText.length > 500 ? result.extractedText.substring(0, 500) + '...' : result.extractedText}</p>
+                    </div>
+                  )}
+
                   {result.flags && result.flags.length > 0 && (
                     <div className="mb-6 relative z-10">
                        <div className="font-mono text-[10px] uppercase opacity-50 mb-3">Detected Flags</div>
@@ -644,6 +726,7 @@ Return ONLY a raw JSON object (no markdown, no backticks) with this exact struct
           </div>
         </main>
       </div>
+      <UpgradeModal isOpen={showUpgradeModal} onClose={() => setShowUpgradeModal(false)} />
     </>
   )
 }

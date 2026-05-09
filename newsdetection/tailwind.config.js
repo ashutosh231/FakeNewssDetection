@@ -54,6 +54,19 @@ export default {
           from: { transform: 'rotate(360deg)' },
           to:   { transform: 'rotate(0deg)' },
         },
+        'float-slow': {
+          '0%, 100%': { transform: 'translateY(0px) rotate(0deg)' },
+          '50%':      { transform: 'translateY(-20px) rotate(3deg)' },
+        },
+        'float-mid': {
+          '0%, 100%': { transform: 'translateY(0px) rotate(0deg)' },
+          '33%':      { transform: 'translateY(-12px) rotate(-2deg)' },
+          '66%':      { transform: 'translateY(-18px) rotate(2deg)' },
+        },
+        'float-fast': {
+          '0%, 100%': { transform: 'translateY(0px) scale(1)' },
+          '50%':      { transform: 'translateY(-10px) scale(1.05)' },
+        },
       },
       animation: {
         glitch:              'glitch 0.3s infinite',
@@ -63,6 +76,9 @@ export default {
         'scan-line':         'scanLine 3s linear infinite',
         'ring-rotate':       'ringRotate 8s linear infinite',
         'ring-rotate-rev':   'ringRotateReverse 12s linear infinite',
+        'float-slow':        'float-slow 6s ease-in-out infinite',
+        'float-mid':         'float-mid 4.5s ease-in-out infinite',
+        'float-fast':        'float-fast 3s ease-in-out infinite',
       },
     },
   },

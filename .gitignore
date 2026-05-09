@@ -1,2 +1,8 @@
 .env
 node_modules
+.DS_Store
+*.log
+backend/test-err.js
+backend/test-upload.js
+backend/test.js
+backend/uploads/
