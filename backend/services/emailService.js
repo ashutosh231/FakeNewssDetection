@@ -1,75 +1,74 @@
-const nodemailer = require('nodemailer');
+/**
+ * Email Service — Uses Brevo HTTP API (v3) instead of SMTP.
+ * This is more reliable on cloud platforms (Render, Railway, etc.)
+ * which often block outbound SMTP ports.
+ *
+ * Requires: BREVO_API_KEY in .env
+ * Get yours at: https://app.brevo.com/settings/keys/api
+ */
 
-// Lazy-initialized transporter — created on first use to ensure env vars are loaded
-let _transporter = null;
+const BREVO_API_URL = 'https://api.brevo.com/v3/smtp/email';
 
-const getTransporter = () => {
-  if (!_transporter) {
-    const host = process.env.BREVO_SMTP_HOST || 'smtp-relay.brevo.com';
-    const port = parseInt(process.env.BREVO_SMTP_PORT) || 587;
-    const user = process.env.BREVO_SMTP_USER;
-    const pass = process.env.BREVO_SMTP_PASS;
-
-    if (!user || !pass) {
-      console.error('[EMAIL] BREVO_SMTP_USER or BREVO_SMTP_PASS not set in environment variables!');
-      return null;
-    }
-
-    _transporter = nodemailer.createTransport({
-      host,
-      port,
-      secure: false, // Use STARTTLS on port 587
-      auth: { user, pass },
-      tls: {
-        // Don't fail on invalid certs (Brevo sometimes has cert issues)
-        rejectUnauthorized: false,
-      },
-      // Connection timeouts
-      connectionTimeout: 10000, // 10 seconds
-      greetingTimeout: 10000,
-      socketTimeout: 15000,
-    });
-
-    console.log(`[EMAIL] Transporter created — host: ${host}, port: ${port}, user: ${user}`);
-  }
-  return _transporter;
-};
-
-// Helper to send an email with error logging
-const safeSendMail = async (mailOptions, label = 'email') => {
-  const transporter = getTransporter();
-  if (!transporter) {
-    console.error(`[EMAIL] Cannot send ${label} — transporter not configured (missing credentials)`);
-    throw new Error('Email service not configured');
+/**
+ * Send a transactional email via Brevo HTTP API.
+ * @param {Object} options
+ * @param {Object} options.sender  - { name, email }
+ * @param {Array}  options.to      - [{ name, email }]
+ * @param {string} options.subject
+ * @param {string} options.htmlContent
+ * @param {Object} [options.replyTo] - { email }
+ */
+const sendEmail = async ({ sender, to, subject, htmlContent, replyTo }) => {
+  const apiKey = process.env.BREVO_API_KEY;
+  if (!apiKey) {
+    console.error('[EMAIL] BREVO_API_KEY is not set! Get yours at: https://app.brevo.com/settings/keys/api');
+    throw new Error('Email service not configured — missing API key');
   }
 
-  try {
-    const info = await transporter.sendMail(mailOptions);
-    console.log(`[EMAIL] ${label} sent successfully — messageId: ${info.messageId}`);
-    return info;
-  } catch (error) {
-    console.error(`[EMAIL] Failed to send ${label}:`, error.message);
-    console.error(`[EMAIL] Error code: ${error.code}, command: ${error.command}`);
-    // Reset transporter on auth errors so it recreates on next attempt
-    if (error.code === 'EAUTH' || error.responseCode === 535) {
-      console.error('[EMAIL] Auth failure — resetting transporter. Check BREVO_SMTP_USER and BREVO_SMTP_PASS.');
-      _transporter = null;
-    }
-    throw error; // Re-throw so callers know it failed
+  const body = {
+    sender,
+    to,
+    subject,
+    htmlContent,
+  };
+  if (replyTo) body.replyTo = replyTo;
+
+  const response = await fetch(BREVO_API_URL, {
+    method: 'POST',
+    headers: {
+      'accept': 'application/json',
+      'content-type': 'application/json',
+      'api-key': apiKey,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    console.error(`[EMAIL] Brevo API error (${response.status}):`, JSON.stringify(errorData));
+    throw new Error(errorData.message || `Brevo API returned ${response.status}`);
   }
+
+  const data = await response.json();
+  console.log(`[EMAIL] Sent successfully — messageId: ${data.messageId}`);
+  return data;
 };
 
-const getFromAddress = () => {
-  return `"${process.env.BREVO_FROM_NAME || 'TruthScanAI'}" <${process.env.BREVO_FROM_EMAIL || 'noreply@truthscan.ai'}>`;
-};
+// ── Default sender ─────────────────────────────────────────
+const getDefaultSender = () => ({
+  name: process.env.BREVO_FROM_NAME || 'TruthScanAI',
+  email: process.env.BREVO_FROM_EMAIL || 'adiashuto30@gmail.com',
+});
+
+// ── Email Functions ────────────────────────────────────────
 
 const sendWelcomeEmail = async (userEmail, userName) => {
   try {
-    await safeSendMail({
-      from: getFromAddress(),
-      to: userEmail,
+    await sendEmail({
+      sender: getDefaultSender(),
+      to: [{ email: userEmail, name: userName }],
       subject: 'Welcome to TruthScan AI!',
-      html: `
+      htmlContent: `
         <div style="font-family: monospace; max-width: 600px; margin: 0 auto; padding: 40px 20px;">
           <div style="background: #09090B; color: white; padding: 30px; text-align: center;">
             <h1 style="font-size: 28px; letter-spacing: -1px; margin: 0;">TRUTHSCAN AI</h1>
@@ -84,7 +83,7 @@ const sendWelcomeEmail = async (userEmail, userName) => {
           </div>
         </div>
       `,
-    }, `welcome email to ${userEmail}`);
+    });
   } catch (error) {
     // Welcome email is non-critical — don't block signup
     console.error('[EMAIL] Welcome email failed (non-critical):', error.message);
@@ -93,11 +92,11 @@ const sendWelcomeEmail = async (userEmail, userName) => {
 
 const sendPaymentConfirmation = async (userEmail, userName) => {
   try {
-    await safeSendMail({
-      from: getFromAddress(),
-      to: userEmail,
+    await sendEmail({
+      sender: getDefaultSender(),
+      to: [{ email: userEmail, name: userName }],
       subject: 'TruthScan AI — Premium Activated!',
-      html: `
+      htmlContent: `
         <div style="font-family: monospace; max-width: 600px; margin: 0 auto; padding: 40px 20px;">
           <div style="background: #D2E823; color: #09090B; padding: 30px; text-align: center; border: 2px solid #09090B;">
             <h1 style="font-size: 28px; letter-spacing: -1px; margin: 0;">★ PREMIUM ACTIVATED</h1>
@@ -111,19 +110,19 @@ const sendPaymentConfirmation = async (userEmail, userName) => {
           </div>
         </div>
       `,
-    }, `payment confirmation to ${userEmail}`);
+    });
   } catch (error) {
     console.error('[EMAIL] Payment confirmation failed (non-critical):', error.message);
   }
 };
 
 const sendOtpEmail = async (userEmail, userName, otp) => {
-  // OTP email is CRITICAL — must throw on failure so the caller knows
-  await safeSendMail({
-    from: getFromAddress(),
-    to: userEmail,
+  // OTP is CRITICAL — must throw on failure
+  await sendEmail({
+    sender: getDefaultSender(),
+    to: [{ email: userEmail, name: userName }],
     subject: 'Your TruthScan AI Verification Code',
-    html: `
+    htmlContent: `
       <div style="font-family: monospace; max-width: 600px; margin: 0 auto; padding: 40px 20px;">
         <div style="background: #09090B; color: white; padding: 30px; text-align: center;">
           <h1 style="font-size: 28px; letter-spacing: -1px; margin: 0;">VERIFICATION REQUIRED</h1>
@@ -139,16 +138,16 @@ const sendOtpEmail = async (userEmail, userName, otp) => {
         </div>
       </div>
     `,
-  }, `OTP to ${userEmail}`);
+  });
 };
 
 const sendDeleteOtpEmail = async (userEmail, userName, otp) => {
   // Deletion OTP is CRITICAL — must throw on failure
-  await safeSendMail({
-    from: getFromAddress(),
-    to: userEmail,
+  await sendEmail({
+    sender: getDefaultSender(),
+    to: [{ email: userEmail, name: userName }],
     subject: 'URGENT: Account Deletion Code',
-    html: `
+    htmlContent: `
       <div style="font-family: monospace; max-width: 600px; margin: 0 auto; padding: 40px 20px;">
         <div style="background: #ef4444; color: white; padding: 30px; text-align: center; border: 2px solid #09090B;">
           <h1 style="font-size: 28px; letter-spacing: -1px; margin: 0;">ACCOUNT DELETION</h1>
@@ -165,17 +164,17 @@ const sendDeleteOtpEmail = async (userEmail, userName, otp) => {
         </div>
       </div>
     `,
-  }, `deletion OTP to ${userEmail}`);
+  });
 };
 
 const sendSupportQueryEmail = async (userEmail, userName, message) => {
   // Support query — must throw on failure so user sees error
-  await safeSendMail({
-    from: getFromAddress(),
-    replyTo: userEmail,
-    to: process.env.BREVO_FROM_EMAIL || 'adiashuto30@gmail.com',
+  await sendEmail({
+    sender: getDefaultSender(),
+    to: [{ email: process.env.BREVO_FROM_EMAIL || 'adiashuto30@gmail.com' }],
+    replyTo: { email: userEmail },
     subject: `Support Query: TruthScan AI - ${userName}`,
-    html: `
+    htmlContent: `
       <div style="font-family: monospace; max-width: 600px; margin: 0 auto; padding: 40px 20px;">
         <div style="background: #09090B; color: white; padding: 30px; border: 2px solid #09090B;">
           <h1 style="font-size: 24px; letter-spacing: -1px; margin: 0;">NEW SUPPORT QUERY</h1>
@@ -188,7 +187,7 @@ const sendSupportQueryEmail = async (userEmail, userName, message) => {
         </div>
       </div>
     `,
-  }, `support query from ${userEmail}`);
+  });
 };
 
 module.exports = { sendWelcomeEmail, sendPaymentConfirmation, sendOtpEmail, sendDeleteOtpEmail, sendSupportQueryEmail };
