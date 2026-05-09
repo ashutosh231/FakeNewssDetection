@@ -2,7 +2,11 @@ import { useState, useEffect } from 'react'
 
 const EVENT_REGISTRY_API_KEY = "7b9d03bd-dca0-43b4-a1cc-7a3e39ff7256"
 const BASE_URL = "https://eventregistry.org/api/v1/article/getArticles"
-const NVIDIA_API_KEY = import.meta.env.VITE_NVIDIA_API_KEY
+
+// Use Netlify function proxy in production, direct URL in local dev
+const NVIDIA_PROXY_URL = import.meta.env.DEV
+  ? "https://integrate.api.nvidia.com/v1/chat/completions"
+  : "/.netlify/functions/nvidia-proxy"
 
 export default function LiveNews() {
   const [articles, setArticles] = useState([])
@@ -48,7 +52,6 @@ export default function LiveNews() {
     setAnalyzingId(article.uri)
     try {
       const textToAnalyze = `Title: ${article.title}\nBody: ${article.body}`
-      const url = "https://integrate.api.nvidia.com/v1/chat/completions"
       
       const prompt = `You are a misinformation detection AI. Analyze this news article.
       Article: "${textToAnalyze}"
@@ -60,12 +63,15 @@ export default function LiveNews() {
         "flags": ["<1-2 short flags like 'Biased tone' or 'None'>"]
       }`
 
-      const res = await fetch(url, {
+      // Build headers — include Authorization only in local dev (proxy handles it in production)
+      const headers = { 'Content-Type': 'application/json' }
+      if (import.meta.env.DEV) {
+        headers['Authorization'] = `Bearer ${import.meta.env.VITE_NVIDIA_API_KEY}`
+      }
+
+      const res = await fetch(NVIDIA_PROXY_URL, {
         method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${NVIDIA_API_KEY}`
-        },
+        headers,
         body: JSON.stringify({
           model: "meta/llama-3.1-70b-instruct",
           messages: [{ role: "user", content: prompt }],

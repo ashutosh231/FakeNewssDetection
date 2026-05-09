@@ -3,6 +3,9 @@
   publish = "newsdetection/dist"
   command = "npm run build"
 
+[functions]
+  directory = "newsdetection/netlify/functions"
+
 [build.environment]
   NODE_VERSION = "20"
 
