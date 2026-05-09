@@ -22,9 +22,7 @@ export default function Navbar() {
           <div className={`w-8 h-8 border-2 rounded-lg flex items-center justify-center overflow-hidden ${
             isOnScan ? 'bg-[#09090B] border-[#D2E823]' : 'bg-[#D2E823] border-[#09090B]'
           }`}>
-            {/* You can replace the src below with your custom app logo URL from Cloudinary */}
-            {/* <img src="YOUR_CLOUDINARY_LOGO_URL" alt="Logo" className="w-full h-full object-cover" /> */}
-            <iconify-icon icon="lucide:shield-check" class={`text-sm ${isOnScan ? 'text-[#D2E823]' : 'text-[#09090B]'}`} />
+            <img src="/logo.png" alt="TruthScan AI Logo" className="w-full h-full object-cover" />
           </div>
           <span className="hidden sm:inline">TRUTHSCAN AI</span>
         </Link>
