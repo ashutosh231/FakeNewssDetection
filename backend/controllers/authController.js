@@ -41,7 +41,13 @@ const signupUser = asyncHandler(async (req, res) => {
 
   if (user) {
     await redisClient.setEx(`otp:verify:${email}`, 600, otp);
-    sendOtpEmail(user.email, user.name, otp);
+    try {
+      await sendOtpEmail(user.email, user.name, otp);
+    } catch (emailErr) {
+      console.error('[SIGNUP] OTP email failed:', emailErr.message);
+      res.status(500);
+      throw new Error('Failed to send verification email. Please try again later.');
+    }
     res.status(200).json({
       message: 'OTP sent successfully',
       requireOtp: true,
@@ -94,7 +100,13 @@ const loginUser = asyncHandler(async (req, res) => {
     if (!user.isVerified) {
       const otp = Math.floor(100000 + Math.random() * 900000).toString();
       await redisClient.setEx(`otp:verify:${user.email}`, 600, otp); // 10 minutes expiry
-      sendOtpEmail(user.email, user.name, otp);
+      try {
+        await sendOtpEmail(user.email, user.name, otp);
+      } catch (emailErr) {
+        console.error('[LOGIN] OTP email failed:', emailErr.message);
+        res.status(500);
+        throw new Error('Failed to send verification email. Please try again later.');
+      }
       
       res.status(403).json({
         message: 'Please verify your email. A new OTP has been sent.',
