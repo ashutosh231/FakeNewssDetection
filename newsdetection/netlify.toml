@@ -1,27 +1,3 @@
-[build]
-  base    = "newsdetection"
-  publish = "dist"
-  command = "npm run build"
-
-[build.environment]
-  NODE_VERSION = "20"
-
-# Proxy /api calls to the Render backend (avoids CORS issues with cookies)
-[[redirects]]
-  from   = "/api/*"
-  to     = "https://truthscannai-vqii.onrender.com/api/:splat"
-  status = 200
-  force  = true
-
-# Proxy NVIDIA AI calls
-[[redirects]]
-  from  = "/api/nvidia/*"
-  to    = "https://integrate.api.nvidia.com/:splat"
-  status = 200
-  force  = true
-
-# SPA fallback — must be last
-[[redirects]]
-  from   = "/*"
-  to     = "/index.html"
-  status = 200
+# This file is intentionally minimal.
+# All Netlify build config and redirects are defined in the ROOT netlify.toml
+# at the repository root level.
