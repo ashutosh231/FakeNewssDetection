@@ -1,14 +1,27 @@
 [build]
+  base    = "newsdetection"
   publish = "dist"
   command = "npm run build"
 
-[[redirects]]
-  from = "/api/nvidia/*"
-  to = "https://integrate.api.nvidia.com/:splat"
-  status = 200
-  force = true
+[build.environment]
+  NODE_VERSION = "20"
 
+# Proxy /api calls to the Render backend (avoids CORS issues with cookies)
 [[redirects]]
-  from = "/*"
-  to = "/index.html"
+  from   = "/api/*"
+  to     = "https://YOUR_RENDER_APP_NAME.onrender.com/api/:splat"
+  status = 200
+  force  = true
+
+# Proxy NVIDIA AI calls
+[[redirects]]
+  from  = "/api/nvidia/*"
+  to    = "https://integrate.api.nvidia.com/:splat"
+  status = 200
+  force  = true
+
+# SPA fallback — must be last
+[[redirects]]
+  from   = "/*"
+  to     = "/index.html"
   status = 200

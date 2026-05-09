@@ -6,3 +6,4 @@ backend/test-err.js
 backend/test-upload.js
 backend/test.js
 backend/uploads/
+newsdetection/dist/

@@ -6,11 +6,11 @@ export default defineConfig({
   plugins: [react()],
   server: {
     proxy: {
-      '/api/nvidia': {
-        target: 'https://integrate.api.nvidia.com',
+      // Proxy API calls to local backend during development
+      '/api': {
+        target: 'http://localhost:5001',
         changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/api\/nvidia/, '')
-      }
+      },
     }
   }
 })
