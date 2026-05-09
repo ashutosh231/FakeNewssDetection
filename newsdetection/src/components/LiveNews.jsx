@@ -48,7 +48,7 @@ export default function LiveNews() {
     setAnalyzingId(article.uri)
     try {
       const textToAnalyze = `Title: ${article.title}\nBody: ${article.body}`
-      const url = "/api/nvidia/v1/chat/completions"
+      const url = "https://integrate.api.nvidia.com/v1/chat/completions"
       
       const prompt = `You are a misinformation detection AI. Analyze this news article.
       Article: "${textToAnalyze}"

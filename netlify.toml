@@ -6,14 +6,7 @@
 [build.environment]
   NODE_VERSION = "20"
 
-# ── Proxy /api/* → Render backend ──
-[[redirects]]
-  from   = "/api/*"
-  to     = "https://truthscannai-vqii.onrender.com/api/:splat"
-  status = 200
-  force  = true
-
-# ── SPA fallback — must be LAST ──
+# SPA client-side routing
 [[redirects]]
   from   = "/*"
   to     = "/index.html"
