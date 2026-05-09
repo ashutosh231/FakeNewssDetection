@@ -11,6 +11,7 @@ import Login from './components/Login'
 import Signup from './components/Signup'
 import Profile from './components/Profile'
 import Pricing from './components/Pricing'
+import ProtectedRoute from './components/ProtectedRoute'
 
 function App() {
   return (
@@ -30,7 +31,7 @@ function App() {
           <Route path="/about" element={<About />} />
           <Route path="/login" element={<Login />} />
           <Route path="/signup" element={<Signup />} />
-          <Route path="/profile" element={<Profile />} />
+          <Route path="/profile" element={<ProtectedRoute><Profile /></ProtectedRoute>} />
           <Route path="/plans" element={<Pricing />} />
         </Routes>
       </AuthProvider>

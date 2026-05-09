@@ -241,9 +241,10 @@ export default function ScanContent() {
       setProgress(100)
       
       if (user) {
+        const scanInputType = activeTab === 'url' ? 'url' : (capturedImage ? 'image' : 'text');
         saveScanResult({
           content: parsed.extractedText,
-          inputType: activeTab,
+          inputType: scanInputType,
           credibilityScore: parsed.score,
           riskLevel: parsed.bias,
           verdict: parsed.score >= 70 ? 'True' : parsed.score >= 40 ? 'Misleading' : 'Fake',

@@ -1,5 +1,6 @@
 const asyncHandler = require('../utils/asyncHandler');
 const User = require('../models/User');
+const ScanHistory = require('../models/ScanHistory');
 const generateToken = require('../utils/generateToken');
 const cloudinary = require('cloudinary').v2;
 const { redisClient } = require('../config/redis');
@@ -111,7 +112,10 @@ const loginUser = asyncHandler(async (req, res) => {
       role: user.role,
       subscriptionPlan: user.subscriptionPlan,
       freeScansUsed: user.freeScansUsed,
-      profileImage: user.profileImage
+      totalScans: user.totalScans || 0,
+      profileImage: user.profileImage,
+      createdAt: user.createdAt,
+      subscriptionExpiry: user.subscriptionExpiry
     });
   } else {
     res.status(401);
@@ -147,7 +151,11 @@ const googleAuthUser = asyncHandler(async (req, res) => {
     email: user.email,
     role: user.role,
     subscriptionPlan: user.subscriptionPlan,
-    profileImage: user.profileImage
+    freeScansUsed: user.freeScansUsed,
+    totalScans: user.totalScans || 0,
+    profileImage: user.profileImage,
+    createdAt: user.createdAt,
+    subscriptionExpiry: user.subscriptionExpiry
   });
 });
 
@@ -207,13 +215,31 @@ const getUserProfile = asyncHandler(async (req, res) => {
   }
 
   const user = await User.findById(req.user._id).select('-password');
-  if (user) {
-    await redisClient.setEx(`cache:user:${req.user._id}`, 3600, JSON.stringify(user));
-    res.json(user);
-  } else {
+  if (!user) {
     res.status(404);
     throw new Error('User not found');
   }
+
+  // Count actual scans from ScanHistory for accuracy
+  const scanCount = await ScanHistory.countDocuments({ userId: req.user._id });
+
+  const profileData = {
+    _id: user._id,
+    name: user.name,
+    email: user.email,
+    role: user.role,
+    profileImage: user.profileImage,
+    subscriptionPlan: user.subscriptionPlan,
+    subscriptionActive: user.subscriptionActive,
+    subscriptionExpiry: user.subscriptionExpiry,
+    freeScansUsed: user.freeScansUsed,
+    totalScans: scanCount,
+    createdAt: user.createdAt,
+    updatedAt: user.updatedAt
+  };
+
+  await redisClient.setEx(`cache:user:${req.user._id}`, 3600, JSON.stringify(profileData));
+  res.json(profileData);
 });
 
 const updateUserProfile = asyncHandler(async (req, res) => {

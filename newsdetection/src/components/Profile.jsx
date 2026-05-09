@@ -38,9 +38,7 @@ export default function Profile() {
   const [supportLoading, setSupportLoading] = useState(false)
   const [supportStatus, setSupportStatus] = useState({ type: '', text: '' })
 
-  useEffect(() => {
-    if (!user) navigate('/login')
-  }, [user, navigate])
+  // Auth is now handled by ProtectedRoute wrapper — no redirect needed here
 
   useEffect(() => {
     if (tab === 'history') {
@@ -259,11 +257,11 @@ export default function Profile() {
               </div>
               <div className="border-2 border-[#09090B] p-5">
                 <div className="uppercase text-[10px] tracking-widest opacity-50 mb-1">Total Scans</div>
-                <div className="font-bold text-lg">{user.freeScansUsed || 0}</div>
+                <div className="font-bold text-lg">{user.totalScans || 0}</div>
               </div>
               <div className="border-2 border-[#09090B] p-5">
                 <div className="uppercase text-[10px] tracking-widest opacity-50 mb-1">Member Since</div>
-                <div className="font-bold text-lg">{new Date(user.createdAt).toLocaleDateString()}</div>
+                <div className="font-bold text-lg">{user.createdAt ? new Date(user.createdAt).toLocaleDateString() : 'N/A'}</div>
               </div>
               <div className="border-2 border-[#09090B] p-5">
                 <div className="uppercase text-[10px] tracking-widest opacity-50 mb-1">Role</div>

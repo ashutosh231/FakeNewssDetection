@@ -18,10 +18,13 @@ const scanText = asyncHandler(async (req, res) => {
     throw new Error('User not found');
   }
 
+  // Normalize inputType to schema-valid values
+  const normalizedInputType = ['text', 'image', 'url'].includes(inputType) ? inputType : 'text';
+
   // Log the scan history
   const history = await ScanHistory.create({
     userId: req.user._id,
-    inputType: inputType || 'text',
+    inputType: normalizedInputType,
     content,
     credibilityScore: credibilityScore || 50,
     riskLevel: riskLevel || 'Medium',
@@ -29,11 +32,14 @@ const scanText = asyncHandler(async (req, res) => {
     flags: flags || []
   });
 
-  // Increment usage for free users
+  // Always increment total scans for all users
+  user.totalScans = (user.totalScans || 0) + 1;
+
+  // Also track free usage for rate limiting
   if (user.subscriptionPlan === 'free') {
     user.freeScansUsed += 1;
-    await user.save();
   }
+  await user.save();
 
   // Invalidate scan history cache and user cache (since freeScansUsed changed)
   await redisClient.del(`cache:scans:${req.user._id}`);

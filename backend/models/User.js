@@ -28,6 +28,10 @@ const userSchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
+  totalScans: {
+    type: Number,
+    default: 0
+  },
   subscriptionActive: {
     type: Boolean,
     default: false
