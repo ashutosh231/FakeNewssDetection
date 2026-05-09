@@ -1,3 +1,19 @@
-# This file is intentionally minimal.
-# All Netlify build config and redirects are defined in the ROOT netlify.toml
-# at the repository root level.
+[build]
+  publish = "dist"
+  command = "npm run build"
+
+[build.environment]
+  NODE_VERSION = "20"
+
+# ── Proxy /api/* → Render backend ──
+[[redirects]]
+  from   = "/api/*"
+  to     = "https://truthscannai-vqii.onrender.com/api/:splat"
+  status = 200
+  force  = true
+
+# ── SPA fallback — must be LAST ──
+[[redirects]]
+  from   = "/*"
+  to     = "/index.html"
+  status = 200
