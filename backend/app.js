@@ -22,9 +22,11 @@ const app = express();
 
 // CORS must come BEFORE helmet so preflight OPTIONS requests aren't blocked
 const allowedOrigins = [
-  process.env.CLIENT_URL || 'http://localhost:5173',
   'http://localhost:5173',
-];
+  'https://truthscannai.netlify.app',      // Production Netlify URL
+  process.env.CLIENT_URL,                  // Dynamic override via env var
+].filter(Boolean);
+
 
 app.use(cors({
   origin: (origin, callback) => {

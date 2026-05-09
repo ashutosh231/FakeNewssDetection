@@ -1,4 +1,7 @@
-const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:5001/api';
+// In production: Netlify proxies /api/* → Render backend (no CORS issues)
+// In development: Vite proxies /api/* → localhost:5001
+const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api';
+
 
 const apiFetch = async (endpoint, options = {}) => {
   const res = await fetch(`${API_BASE}${endpoint}`, {
