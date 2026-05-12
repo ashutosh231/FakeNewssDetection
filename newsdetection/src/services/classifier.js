@@ -1,60 +1,90 @@
-/**
- * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * LAYER 1 — FAKE NEWS CLASSIFIER
- * Model: hamzab/roberta-fake-news-classification
- * Purpose: Binary fake/real classification with confidence
- * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- */
-
 import { HfInference } from "@huggingface/inference";
 
 const hf = new HfInference(import.meta.env.VITE_HF_TOKEN);
 
-/**
- * Classifies text as FAKE or REAL using a fine-tuned RoBERTa model.
- * @param {string} text - The news content to classify
- * @returns {Promise<{ label: string, confidence: number, scores: object }>}
- */
+const MODELS = [
+  "hamzab/roberta-fake-news-classification",
+  "mrm8488/bert-tiny-finetuned-fake-news-detection",
+];
+
+const normalizeLabel = (label) => {
+  const upper = (label || "").toUpperCase();
+  if (upper === "LABEL_0") return "REAL";
+  if (upper === "LABEL_1") return "FAKE";
+  if (upper === "FAKE" || upper === "FAKE NEWS") return "FAKE";
+  if (upper === "REAL" || upper === "TRUE" || upper === "VERIFIED") return "REAL";
+  return upper;
+};
+
 export const classifyFakeNews = async (text) => {
-  try {
-    // Truncate to model's max token limit (~512 tokens ≈ 2000 chars)
-    const truncated = text.substring(0, 2000);
+  const results = [];
+  const errors = [];
 
-    const result = await hf.textClassification({
-      model: "hamzab/roberta-fake-news-classification",
-      inputs: truncated,
-    });
+  for (const model of MODELS) {
+    try {
+      const truncated = text.substring(0, 2000);
+      const result = await hf.textClassification({ model, inputs: truncated });
+      if (!result || !Array.isArray(result) || result.length === 0) continue;
 
-    if (!result || !Array.isArray(result) || result.length === 0) {
-      throw new Error("Empty classification response.");
+      const topResult = result[0];
+      const scores = {};
+      result.forEach((r) => {
+        scores[normalizeLabel(r.label)] = Math.round((r.score || 0) * 100);
+      });
+
+      const label = normalizeLabel(topResult.label);
+      const confidence = Math.round((topResult.score || 0) * 100);
+
+      results.push({ label, confidence, scores, model });
+    } catch (err) {
+      errors.push(`${model}: ${err?.message}`);
     }
+  }
 
-    // result is an array of { label, score } sorted by score desc
-    const topResult = result[0];
-    const allScores = {};
-    result.forEach((r) => {
-      allScores[r?.label || "unknown"] = Math.round((r?.score || 0) * 100);
-    });
-
-    // Normalize label — model may return "FAKE"/"REAL" or "LABEL_0"/"LABEL_1"
-    let normalizedLabel = topResult?.label?.toUpperCase() || "UNKNOWN";
-    if (normalizedLabel === "LABEL_0") normalizedLabel = "REAL";
-    if (normalizedLabel === "LABEL_1") normalizedLabel = "FAKE";
-
-    return {
-      label: normalizedLabel,
-      confidence: Math.round((topResult?.score || 0) * 100),
-      scores: allScores,
-      raw: result,
-    };
-  } catch (err) {
-    console.error("[CLASSIFIER] Fake news classification failed:", err);
+  if (results.length === 0) {
     return {
       label: "UNKNOWN",
       confidence: 0,
       scores: {},
-      raw: null,
-      error: err?.message || "Classification model unavailable",
+      modelsTried: MODELS,
+      errors,
     };
   }
+
+  const labelVotes = {};
+  results.forEach((r) => {
+    labelVotes[r.label] = (labelVotes[r.label] || 0) + 1;
+  });
+
+  const fakeScores = results.map(r =>
+    r.label === "FAKE" ? r.confidence : 100 - r.confidence
+  );
+  const avgFake = Math.round(fakeScores.reduce((a, b) => a + b, 0) / fakeScores.length);
+
+  const realScores = results.map(r =>
+    r.label === "REAL" ? r.confidence : 100 - r.confidence
+  );
+  const avgReal = Math.round(realScores.reduce((a, b) => a + b, 0) / realScores.length);
+
+  const finalLabel = avgFake > avgReal ? "FAKE" : "REAL";
+  const finalConfidence = finalLabel === "FAKE" ? avgFake : avgReal;
+
+  const allScores = {};
+  results.forEach((r) => {
+    Object.entries(r.scores).forEach(([k, v]) => {
+      allScores[k] = (allScores[k] || 0) + v;
+    });
+  });
+  Object.keys(allScores).forEach((k) => {
+    allScores[k] = Math.round(allScores[k] / results.length);
+  });
+
+  return {
+    label: finalLabel,
+    confidence: finalConfidence,
+    scores: allScores,
+    modelsUsed: results.length,
+    modelsTried: MODELS,
+    errors: errors.length > 0 ? errors : undefined,
+  };
 };

@@ -9,6 +9,12 @@
   NODE_VERSION = "20"
   VITE_API_URL = "https://truthscanai-vqij.onrender.com"
 
+# Map unified proxy path to the Netlify function (matches Vite dev proxy path)
+[[redirects]]
+  from   = "/nvidia-proxy"
+  to     = "/.netlify/functions/nvidia-proxy"
+  status = 200
+
 # SPA client-side routing — serve index.html for all paths
 [[redirects]]
   from   = "/*"

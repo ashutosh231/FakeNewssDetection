@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
+import { motion, AnimatePresence } from 'framer-motion'
 import Navbar from './Navbar'
-import Cursor from './Cursor'
 import { analyzeNewsRaw } from '../services/huggingface'
 import { extractTextFromImage } from '../services/ocr'
 import { cleanOCRText } from '../utils/cleanOCRText'
@@ -8,107 +8,150 @@ import { saveScanResult } from '../services/api'
 import { useAuth } from '../context/AuthContext'
 import UpgradeModal from './UpgradeModal'
 
-const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY
+/* ──────────────────────────────────────────────────────────────────
+   Pipeline stages (same multi-model chain as Detector + LiveNews)
+   ────────────────────────────────────────────────────────────────── */
+const PIPELINE_STAGES = [
+  { id: 'capture',     label: 'Capture',            icon: 'lucide:camera' },
+  { id: 'ocr',         label: 'OCR Extract',        icon: 'lucide:scan-text' },
+  { id: 'validate',    label: 'Validate Text',      icon: 'lucide:check-circle' },
+  { id: 'retrieval',   label: 'RAG Retrieval',      icon: 'lucide:database' },
+  { id: 'classifier',  label: '2× HF Classifiers',  icon: 'lucide:layers' },
+  { id: 'sentiment',   label: 'HF Sentiment',       icon: 'lucide:gauge' },
+  { id: 'reasoning',   label: 'NVIDIA Llama 3.1',   icon: 'lucide:brain-circuit' },
+  { id: 'scoring',     label: 'Credibility Score',  icon: 'lucide:scale' },
+]
 
+/* Animated counter */
+function Counter({ value, duration = 900 }) {
+  const [display, setDisplay] = useState(0)
+  useEffect(() => {
+    let raf
+    const start = performance.now()
+    const tick = (now) => {
+      const t = Math.min(1, (now - start) / duration)
+      const eased = 1 - Math.pow(1 - t, 3)
+      setDisplay(Math.round(eased * value))
+      if (t < 1) raf = requestAnimationFrame(tick)
+    }
+    raf = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(raf)
+  }, [value, duration])
+  return <>{display}</>
+}
+
+/* Validate extracted OCR text — return { ok, reason } */
+const validateExtractedText = (text) => {
+  if (!text || !text.trim()) {
+    return { ok: false, reason: 'NO_TEXT', message: 'No readable text detected in the image.' }
+  }
+  const trimmed = text.trim()
+  if (trimmed.length < 15) {
+    return { ok: false, reason: 'TOO_SHORT', message: 'Too little text extracted. Try a clearer, closer shot with more readable content.' }
+  }
+  const words = trimmed.split(/\s+/).filter(Boolean)
+  if (words.length < 5) {
+    return { ok: false, reason: 'TOO_FEW_WORDS', message: 'Not enough words to analyze. Please capture a full headline or paragraph.' }
+  }
+  // Ratio of garbage chars (non-alphabetic/common punctuation)
+  const alphaCount = (trimmed.match(/[a-zA-Z]/g) || []).length
+  const alphaRatio = alphaCount / trimmed.length
+  if (alphaRatio < 0.5) {
+    return { ok: false, reason: 'GARBLED', message: 'Text is garbled or unreadable. Try better lighting and steady framing.' }
+  }
+  return { ok: true }
+}
+
+/* Pipeline visualizer node strip */
+function PipelineStrip({ activeStage, completedStages }) {
+  return (
+    <div className="flex items-center gap-1 overflow-x-auto no-scrollbar py-2">
+      {PIPELINE_STAGES.map((stage, i) => {
+        const isActive = activeStage === stage.id
+        const isDone = completedStages.includes(stage.id)
+        return (
+          <div key={stage.id} className="flex items-center shrink-0">
+            <motion.div
+              animate={{ scale: isActive ? 1.05 : 1 }}
+              className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border transition-colors ${
+                isActive
+                  ? 'bg-[#C8FF00] text-[#09090B] border-[#C8FF00]'
+                  : isDone
+                    ? 'bg-[#C8FF00]/10 text-[#C8FF00] border-[#C8FF00]/30'
+                    : 'bg-white/5 text-white/30 border-white/10'
+              }`}
+            >
+              <iconify-icon icon={isDone ? 'lucide:check' : stage.icon} class="text-xs" />
+              <span className="font-mono text-[9px] font-bold uppercase tracking-wider">{stage.label}</span>
+              {isActive && (
+                <motion.div
+                  className="w-1 h-1 rounded-full bg-[#09090B]"
+                  animate={{ opacity: [0.3, 1, 0.3] }}
+                  transition={{ duration: 0.9, repeat: Infinity }}
+                />
+              )}
+            </motion.div>
+            {i < PIPELINE_STAGES.length - 1 && (
+              <div className={`w-3 h-[2px] ${isDone ? 'bg-[#C8FF00]' : 'bg-white/10'}`} />
+            )}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+/* ──────────────────────────────────────────────────────────────────
+   Main component
+   ────────────────────────────────────────────────────────────────── */
 export default function ScanContent() {
   const { user, refreshUser } = useAuth()
-  const [activeTab, setActiveTab] = useState('camera')
+  const [mode, setMode] = useState('camera') // camera | upload | url
   const [showUpgradeModal, setShowUpgradeModal] = useState(false)
-  const [inputText, setInputText] = useState('')
-  const [inputUrl, setInputUrl] = useState('')
-  const [fileContent, setFileContent] = useState('')
-  const [fileName, setFileName] = useState('')
 
+  // Camera
   const videoRef = useRef(null)
   const canvasRef = useRef(null)
+  const streamRef = useRef(null)
+  const fileInputRef = useRef(null)
   const [cameraActive, setCameraActive] = useState(false)
   const [capturedImage, setCapturedImage] = useState(null)
-  const [ocrText, setOcrText] = useState('')
+  const [cameraError, setCameraError] = useState('')
+
+  // OCR
   const [ocrProgress, setOcrProgress] = useState(0)
+  const [extractedText, setExtractedText] = useState('')
   const [isExtracting, setIsExtracting] = useState(false)
+  const [extractionError, setExtractionError] = useState('')
 
+  // URL mode
+  const [inputUrl, setInputUrl] = useState('')
+
+  // Pipeline
   const [isScanning, setIsScanning] = useState(false)
+  const [activeStage, setActiveStage] = useState(null)
+  const [completedStages, setCompletedStages] = useState([])
   const [result, setResult] = useState(null)
-  const [progress, setProgress] = useState(0)
 
-  // Circular gauge logic
-  const gaugeRadius = 40
-  const gaugeCircumference = 2 * Math.PI * gaugeRadius
-
-  const handleFileChange = async (e) => {
-    const file = e.target.files[0]
-    if (!file) return
-    setFileName(file.name)
-    
-    if (file.type.startsWith('image/')) {
-      const dataUrl = URL.createObjectURL(file)
-      setCapturedImage(dataUrl)
-      setOcrProgress(0)
-      setIsExtracting(true)
-      setFileContent('SCANNING IMAGE...\nOCR Progress: 0%')
-      
-      try {
-        const { text, confidence } = await extractTextFromImage(file, (progress) => {
-          setOcrProgress(progress)
-          setFileContent(`SCANNING IMAGE...\nOCR Progress: ${progress}%`)
-        })
-        const cleaned = cleanOCRText(text)
-        if (!cleaned) throw new Error("Empty extraction")
-        
-        setFileContent(cleaned)
-        setOcrText(cleaned)
-        setIsExtracting(false)
-      } catch (err) {
-        setFileContent('Unable to clearly extract text from image. Please upload a clearer screenshot.')
-        setIsExtracting(false)
-      }
-      return;
-    }
-
-    setCapturedImage(null)
-    setFileContent('Extracting text...')
-    
-    try {
-      if (file.type === 'application/pdf') {
-        const arrayBuffer = await file.arrayBuffer()
-        const pdf = await window.pdfjsLib.getDocument({ data: arrayBuffer }).promise
-        let text = ''
-        for (let i = 1; i <= pdf.numPages; i++) {
-          const page = await pdf.getPage(i)
-          const content = await page.getTextContent()
-          text += content.items.map(item => item.str).join(' ') + ' '
-        }
-        setFileContent(text)
-      } else if (file.type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || file.name.endsWith('.docx')) {
-        const arrayBuffer = await file.arrayBuffer()
-        const { value } = await window.mammoth.extractRawText({ arrayBuffer })
-        setFileContent(value)
-      } else if (file.type === 'text/plain' || file.name.endsWith('.txt')) {
-        const text = await file.text()
-        setFileContent(text)
-      } else {
-        setFileContent('Unsupported file type. Please upload PDF, DOCX, or TXT.')
-      }
-    } catch (err) {
-      setFileContent('Failed to extract text from file.')
-      console.error(err)
-    }
-  }
-
-  // Camera functions
-  const streamRef = useRef(null)
-
+  /* ── Camera controls ── */
   const startCamera = async () => {
+    setCameraError('')
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } } })
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
+      })
       streamRef.current = stream
       setCapturedImage(null)
-      setOcrText('')
+      setExtractedText('')
+      setExtractionError('')
+      setResult(null)
       setCameraActive(true)
-    } catch (err) { console.error('Camera access denied:', err); alert('Camera access denied. Please allow camera permissions.') }
+    } catch (err) {
+      console.error('Camera access denied:', err)
+      setCameraError('Camera access denied. Please enable camera permissions in your browser.')
+    }
   }
 
-  // Attach stream to video element once it's rendered
   useEffect(() => {
     if (cameraActive && videoRef.current && streamRef.current) {
       videoRef.current.srcObject = streamRef.current
@@ -116,614 +159,897 @@ export default function ScanContent() {
   }, [cameraActive])
 
   const stopCamera = () => {
-    if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null }
-    if (videoRef.current) { videoRef.current.srcObject = null }
-     setCameraActive(false)
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop())
+      streamRef.current = null
+    }
+    if (videoRef.current) videoRef.current.srcObject = null
+    setCameraActive(false)
   }
+
+  useEffect(() => () => stopCamera(), [])
+  useEffect(() => {
+    if (mode !== 'camera') stopCamera()
+  }, [mode])
+
   const capturePhoto = () => {
     if (!videoRef.current || !canvasRef.current) return
-    const v = videoRef.current, c = canvasRef.current; c.width = v.videoWidth; c.height = v.videoHeight
+    const v = videoRef.current
+    const c = canvasRef.current
+    c.width = v.videoWidth
+    c.height = v.videoHeight
     c.getContext('2d').drawImage(v, 0, 0)
-    const dataUrl = c.toDataURL('image/jpeg', 0.85)
-    setCapturedImage(dataUrl); stopCamera()
-    // Directly analyze via Gemini Vision — no OCR step
-    analyzeImageDirectly(dataUrl)
+    const dataUrl = c.toDataURL('image/jpeg', 0.9)
+    setCapturedImage(dataUrl)
+    stopCamera()
+    runFullScan(dataUrl)
   }
 
-  const retakePhoto = () => { setCapturedImage(null); setOcrText(''); startCamera() }
-  useEffect(() => { if (activeTab !== 'camera') stopCamera(); return () => stopCamera() }, [activeTab])
-
-  // ── LOCAL OCR + HUGGING FACE PIPELINE: Image → Full Analysis ──
-  const analyzeImageDirectly = async (imgDataUrl) => {
-    if (user?.subscriptionPlan === 'free' && (user?.freeScansUsed || 0) >= 2) {
-      setShowUpgradeModal(true);
-      setCapturedImage(null); startCamera(); return;
-    }
-
-    setIsScanning(true); setResult(null); setProgress(0)
-    const progInterval = setInterval(() => {
-      setProgress(p => p >= 40 ? 40 : p + Math.floor(Math.random() * 5))
-    }, 500)
-
-    try {
-      // 1. OCR Extraction (Tesseract.js)
-      const { text } = await extractTextFromImage(imgDataUrl)
-      const cleanedText = cleanOCRText(text)
-
-      if (!cleanedText) throw new Error("No readable text found in image")
-      setOcrText(cleanedText)
-      
-      clearInterval(progInterval)
-      const progInterval2 = setInterval(() => {
-        setProgress(p => p >= 95 ? 95 : p + Math.floor(Math.random() * 10))
-      }, 400)
-
-      // 2. Multi-Model NLP Pipeline (Hugging Face)
-      const pipelineResult = await analyzeNewsRaw(cleanedText.substring(0, 4000))
-      
-      const parsed = {
-        score: pipelineResult?.credibilityScore ?? 0,
-        sourceTrust: pipelineResult?.layerBreakdown?.source?.score ?? 0,
-        factualAccuracy: pipelineResult?.layerBreakdown?.classifier?.score ?? 0,
-        bias: pipelineResult?.manipulationLevel === 'High' ? 'High' : pipelineResult?.manipulationLevel === 'Moderate' ? 'Medium' : 'Low',
-        manipulation: (pipelineResult?.manipulationLevel || '').toLowerCase() === 'high' || (pipelineResult?.manipulationLevel || '').toLowerCase() === 'moderate',
-        summary: pipelineResult?.explanation || 'No explanation available.',
-        flags: pipelineResult?.flags || [],
-        isImage: true,
-        extractedText: cleanedText.substring(0, 4000),
-      }
-
-      clearInterval(progInterval2)
-      setProgress(100)
-
-      if (user) {
-        saveScanResult({
-          content: parsed.extractedText,
-          inputType: 'image',
-          credibilityScore: parsed.score,
-          riskLevel: parsed.bias,
-          verdict: parsed.score >= 70 ? 'True' : parsed.score >= 40 ? 'Misleading' : 'Fake',
-          flags: parsed.flags
-        }).then(() => refreshUser()).catch(console.error)
-      }
-
-      setTimeout(() => { setIsScanning(false); setResult(parsed) }, 500)
-
-    } catch (err) {
-      console.error('Image analysis failed:', err)
-      clearInterval(progInterval)
-      setProgress(100)
-      setTimeout(() => {
-        setIsScanning(false)
-        setResult({ score: 0, sourceTrust: 0, factualAccuracy: 0, bias: 'High', manipulation: true,
-          summary: err.message === "No readable text found in image" 
-            ? 'No readable text was found in the captured image. Please try again with a clearer photo.' 
-            : 'Image analysis failed to process. Ensure your API keys and network connections are active.',
-          flags: ['Analysis Failed'] })
-      }, 500)
-    }
+  const retakePhoto = () => {
+    setCapturedImage(null)
+    setExtractedText('')
+    setExtractionError('')
+    setResult(null)
+    setCompletedStages([])
+    startCamera()
   }
 
-  // ── TEXT-BASED ANALYSIS (for file/URL tabs) — Multi-Model Pipeline ──
-  const runAnalysis = async () => {
-    let contentToAnalyze = ''
-    if (activeTab === 'file') contentToAnalyze = fileContent
-    if (activeTab === 'url') contentToAnalyze = `Analyze the content of this URL: ${inputUrl}` 
-    if (!contentToAnalyze.trim() || contentToAnalyze.startsWith('Extracting')) return
+  /* ── Upload ── */
+  const handleFileUpload = async (e) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    if (!file.type.startsWith('image/')) {
+      setExtractionError('Only image files are supported in Camera mode. Try uploading JPG or PNG.')
+      return
+    }
+    const dataUrl = URL.createObjectURL(file)
+    setCapturedImage(dataUrl)
+    setExtractedText('')
+    setExtractionError('')
+    setResult(null)
+    runFullScan(dataUrl)
+  }
 
+  /* ── URL scan ── */
+  const runUrlScan = () => {
+    if (!inputUrl.trim()) return
+    const textToScan = inputUrl.trim()
+    runPipelineOnText(textToScan, 'url')
+  }
+
+  /* ── Full scan (image → OCR → validate → pipeline) ── */
+  const runFullScan = async (imageSource) => {
+    // Check quota first
     if (user?.subscriptionPlan === 'free' && (user?.freeScansUsed || 0) >= 2) {
-      setShowUpgradeModal(true);
-      return;
+      setShowUpgradeModal(true)
+      return
     }
 
-    setIsScanning(true); setResult(null); setProgress(0)
-    const progInterval = setInterval(() => {
-      setProgress(p => p >= 95 ? 95 : p + Math.floor(Math.random() * 15))
-    }, 400)
+    setResult(null)
+    setCompletedStages([])
+    setActiveStage('capture')
+    setIsExtracting(true)
+    setExtractionError('')
+    setOcrProgress(0)
+
+    // Stage 1: capture
+    await new Promise((r) => setTimeout(r, 250))
+    setCompletedStages(['capture'])
+    setActiveStage('ocr')
 
     try {
-      const pipelineResult = await analyzeNewsRaw(contentToAnalyze.substring(0, 4000))
+      // Stage 2: OCR
+      const { text } = await extractTextFromImage(imageSource, (p) => setOcrProgress(p))
+      const cleaned = cleanOCRText(text)
+      setExtractedText(cleaned)
+      setCompletedStages((prev) => [...prev, 'ocr'])
+      setActiveStage('validate')
 
-      // Map orchestrator output to the ScanContent result shape
-      const parsed = {
-        score: pipelineResult?.credibilityScore ?? 0,
-        sourceTrust: pipelineResult?.layerBreakdown?.source?.score ?? 0,
-        factualAccuracy: pipelineResult?.layerBreakdown?.classifier?.score ?? 0,
-        bias: pipelineResult?.manipulationLevel === 'High' ? 'High' : pipelineResult?.manipulationLevel === 'Moderate' ? 'Medium' : 'Low',
-        manipulation: (pipelineResult?.manipulationLevel || '').toLowerCase() === 'high' || (pipelineResult?.manipulationLevel || '').toLowerCase() === 'moderate',
-        summary: pipelineResult?.explanation || 'No explanation available.',
-        flags: pipelineResult?.flags || [],
-        isImage: activeTab === 'file' && !!capturedImage,
-        extractedText: contentToAnalyze.substring(0, 4000),
-      }
-
-      clearInterval(progInterval)
-      setProgress(100)
-      
-      if (user) {
-        const scanInputType = activeTab === 'url' ? 'url' : (capturedImage ? 'image' : 'text');
-        saveScanResult({
-          content: parsed.extractedText,
-          inputType: scanInputType,
-          credibilityScore: parsed.score,
-          riskLevel: parsed.bias,
-          verdict: parsed.score >= 70 ? 'True' : parsed.score >= 40 ? 'Misleading' : 'Fake',
-          flags: parsed.flags
-        }).then(() => refreshUser()).catch(console.error)
-      }
-
-      setTimeout(() => {
-        setIsScanning(false)
-        setResult(parsed)
-      }, 500)
-
-    } catch (err) {
-      console.error(err)
-      clearInterval(progInterval)
-      setProgress(100)
-      setTimeout(() => {
-        setIsScanning(false)
+      // Stage 3: Validate
+      await new Promise((r) => setTimeout(r, 300))
+      const validation = validateExtractedText(cleaned)
+      if (!validation.ok) {
+        setIsExtracting(false)
+        setActiveStage(null)
+        setExtractionError(validation.message)
         setResult({
-          score: 0,
-          sourceTrust: 0,
-          factualAccuracy: 0,
-          bias: "High",
-          manipulation: true,
-          summary: "AI Analysis failed to process this content. Ensure your API keys and network connections are active.",
-          flags: ["Analysis Failed", "Network Error"]
+          error: true,
+          errorReason: validation.reason,
+          errorMessage: validation.message,
         })
-      }, 500)
+        return
+      }
+      setCompletedStages((prev) => [...prev, 'validate'])
+      setIsExtracting(false)
+
+      // Continue to pipeline
+      await runPipelineOnText(cleaned, 'image')
+    } catch (err) {
+      console.error('OCR failed:', err)
+      setIsExtracting(false)
+      setActiveStage(null)
+      const msg = 'OCR failed. Please try again with a clearer, higher-contrast image.'
+      setExtractionError(msg)
+      setResult({
+        error: true,
+        errorReason: 'OCR_FAILED',
+        errorMessage: msg,
+      })
     }
   }
 
-  const removeFlag = (idx) => {
-    setResult(prev => ({ ...prev, flags: prev.flags.filter((_, i) => i !== idx) }))
+  /* ── Pipeline on clean text (RAG + multi-model) ── */
+  const runPipelineOnText = async (text, inputType) => {
+    setIsScanning(true)
+    const stageOrder = ['retrieval', 'classifier', 'sentiment', 'reasoning', 'scoring']
+    let stageIdx = 0
+    setActiveStage(stageOrder[0])
+
+    const timer = setInterval(() => {
+      setCompletedStages((prev) => [...prev, stageOrder[stageIdx]])
+      stageIdx += 1
+      if (stageIdx < stageOrder.length) setActiveStage(stageOrder[stageIdx])
+      else clearInterval(timer)
+    }, 800)
+
+    try {
+      const raw = await analyzeNewsRaw(text.substring(0, 4000))
+      clearInterval(timer)
+      setCompletedStages([...PIPELINE_STAGES.map((s) => s.id)])
+      setActiveStage(null)
+      setResult({ ...raw, extractedText: text })
+
+      if (user) {
+        saveScanResult({
+          content: text.substring(0, 4000),
+          inputType,
+          credibilityScore: raw.credibilityScore,
+          riskLevel: raw.riskLevel,
+          verdict: raw.verdict,
+          flags: raw.flags,
+        }).then(() => refreshUser()).catch(console.error)
+      }
+    } catch (err) {
+      console.error('Pipeline failed:', err)
+      clearInterval(timer)
+      setActiveStage(null)
+      setResult({
+        error: true,
+        errorReason: 'PIPELINE_FAILED',
+        errorMessage: 'The AI pipeline failed. Please check your network and try again.',
+      })
+    } finally {
+      setIsScanning(false)
+    }
+  }
+
+  const resetScan = () => {
+    setCapturedImage(null)
+    setExtractedText('')
+    setExtractionError('')
+    setResult(null)
+    setCompletedStages([])
+    setActiveStage(null)
+    setOcrProgress(0)
+    setInputUrl('')
+  }
+
+  const getScoreColor = (score) => {
+    if (score >= 70) return '#C8FF00'
+    if (score >= 40) return '#FBBF24'
+    return '#EF4444'
+  }
+
+  const getRiskStyle = (risk) => {
+    const r = (risk || '').toUpperCase()
+    if (r === 'HIGH RISK') return { text: 'text-red-400', bg: 'bg-red-500/10', border: 'border-red-500/40' }
+    if (r === 'SUSPICIOUS') return { text: 'text-orange-400', bg: 'bg-orange-500/10', border: 'border-orange-500/40' }
+    if (r === 'MODERATE') return { text: 'text-yellow-400', bg: 'bg-yellow-500/10', border: 'border-yellow-500/40' }
+    if (r === 'SAFE') return { text: 'text-green-400', bg: 'bg-green-500/10', border: 'border-green-500/40' }
+    return { text: 'text-white/60', bg: 'bg-white/5', border: 'border-white/10' }
   }
 
   return (
     <>
-      <div className="noise-overlay pointer-events-none z-50 mix-blend-overlay opacity-20" style={{ position: 'fixed', inset: 0, background: 'url(/noise.png)' }} />
-      <Cursor />
       <canvas ref={canvasRef} className="hidden" />
-      <div className="min-h-screen bg-[#09090B] text-[#F8F4E8] font-sans selection:bg-[#C8FF00] selection:text-[#09090B] relative z-10">
+      <div className="min-h-screen bg-[#09090B] text-[#F8F4E8] relative z-10">
         <Navbar />
-        
-        <main className="container mx-auto px-4 md:px-8 py-12 md:py-24 max-w-7xl">
-          <div className="mb-12">
-             <h1 className="font-display text-5xl md:text-6xl uppercase tracking-tighter text-white">
-              INTELLIGENCE <span className="text-[#C8FF00]">SCANNER</span>
-            </h1>
-            <p className="font-mono text-sm opacity-70 mt-2 tracking-widest uppercase text-[#C8FF00]">
-              // Advanced NLP Misinformation Detection Protocol v3.1
-            </p>
-          </div>
 
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 lg:gap-16">
-            
-            {/* LEFT COL: INPUT */}
-            <div className="flex flex-col border border-white/20 bg-[#121212] rounded-[24px] p-6 relative overflow-hidden shadow-2xl">
-              <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-transparent via-[#C8FF00] to-transparent opacity-50" />
-              
-              <div className="flex border-b border-white/10 mb-6 font-mono text-xs uppercase tracking-widest font-bold">
-                <button 
-                  className={`pb-4 px-4 transition-colors flex items-center gap-2 ${activeTab === 'camera' ? 'text-[#C8FF00] border-b-2 border-[#C8FF00]' : 'text-white/50 hover:text-white'}`}
-                  onClick={() => setActiveTab('camera')}
-                >
-                  <iconify-icon icon="lucide:scan-line" /> Scan
-                </button>
-                <button 
-                  className={`pb-4 px-4 transition-colors ${activeTab === 'file' ? 'text-[#C8FF00] border-b-2 border-[#C8FF00]' : 'text-white/50 hover:text-white'}`}
-                  onClick={() => setActiveTab('file')}
-                >
-                  Upload File
-                </button>
-                <button 
-                  className={`pb-4 px-4 transition-colors ${activeTab === 'url' ? 'text-[#C8FF00] border-b-2 border-[#C8FF00]' : 'text-white/50 hover:text-white'}`}
-                  onClick={() => setActiveTab('url')}
-                >
-                  Import URL
-                </button>
+        <main className="container mx-auto px-4 md:px-8 py-8 md:py-12 max-w-7xl">
+          {/* ── Header ── */}
+          <motion.div
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="mb-6"
+          >
+            <p className="font-mono text-[10px] uppercase tracking-[0.3em] text-[#C8FF00]/60 mb-2">
+              // Intelligence Scanner · Multi-Model RAG Chain
+            </p>
+            <div className="flex items-end justify-between flex-wrap gap-4">
+              <div>
+                <h1 className="font-display text-4xl md:text-6xl uppercase tracking-tighter text-white leading-none">
+                  SCAN<span className="text-[#C8FF00]">.</span>
+                </h1>
+                <p className="font-mono text-xs text-white/50 mt-2">
+                  Point your camera, drop an image, or paste a URL. OCR + 2× HF classifiers + NVIDIA Llama handle the rest.
+                </p>
+              </div>
+              <div className="flex items-center gap-2 flex-wrap">
+                {[
+                  { label: 'TESSERACT OCR', style: 'bg-white/5 border-white/10 text-white/70' },
+                  { label: '2× HF CLASSIFIERS', style: 'bg-[#C8FF00] border-[#C8FF00] text-[#09090B]' },
+                  { label: 'HF SENTIMENT', style: 'bg-white/5 border-white/10 text-white/70' },
+                  { label: 'NVIDIA LLAMA 3.1-70B', style: 'bg-white/5 border-white/10 text-white/70' },
+                ].map((c) => (
+                  <span
+                    key={c.label}
+                    className={`font-mono text-[9px] px-2 py-1 border rounded ${c.style}`}
+                  >
+                    {c.label}
+                  </span>
+                ))}
+              </div>
+            </div>
+          </motion.div>
+
+          {/* ── Pipeline strip ── */}
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            transition={{ delay: 0.1 }}
+            className="mb-6 bg-[#121212] border border-white/10 rounded-2xl p-3"
+          >
+            <PipelineStrip activeStage={activeStage} completedStages={completedStages} />
+          </motion.div>
+
+          {/* ── Two-col layout ── */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            {/* ── LEFT: Input ── */}
+            <motion.div
+              initial={{ opacity: 0, x: -20 }}
+              animate={{ opacity: 1, x: 0 }}
+              transition={{ delay: 0.2 }}
+              className="bg-[#121212] border border-white/10 rounded-[24px] overflow-hidden shadow-2xl"
+            >
+              {/* Mode tabs */}
+              <div className="border-b border-white/10 p-3">
+                <div className="flex gap-1 bg-[#09090B] rounded-lg p-1">
+                  {[
+                    { id: 'camera', label: 'Camera', icon: 'lucide:camera' },
+                    { id: 'upload', label: 'Upload', icon: 'lucide:upload' },
+                    { id: 'url', label: 'URL', icon: 'lucide:link' },
+                  ].map((m) => (
+                    <button
+                      key={m.id}
+                      onClick={() => setMode(m.id)}
+                      className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-md text-[10px] uppercase tracking-widest font-bold transition-all ${
+                        mode === m.id
+                          ? 'bg-[#C8FF00] text-[#09090B] shadow-lg shadow-[#C8FF00]/20'
+                          : 'text-white/50 hover:text-white'
+                      }`}
+                    >
+                      <iconify-icon icon={m.icon} class="text-sm" />
+                      {m.label}
+                    </button>
+                  ))}
+                </div>
               </div>
 
-              <div className="flex-1 flex flex-col mb-6">
-                {activeTab === 'camera' && (
-                  <div className="flex-1 flex flex-col min-h-[340px]">
-                    <div className="relative w-full aspect-[4/3] bg-[#09090B] rounded-xl overflow-hidden border border-white/10 mb-4">
-                      {!cameraActive && !capturedImage && (
-                        <div className="absolute inset-0 flex flex-col items-center justify-center gap-4">
-                          <div className="w-20 h-20 rounded-full border-2 border-[#C8FF00]/30 flex items-center justify-center bg-[#C8FF00]/5">
-                            <iconify-icon icon="lucide:camera" class="text-3xl text-[#C8FF00]" />
+              <div className="p-5">
+                <AnimatePresence mode="wait">
+                  {/* Camera mode */}
+                  {mode === 'camera' && (
+                    <motion.div
+                      key="camera"
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      exit={{ opacity: 0 }}
+                      className="space-y-4"
+                    >
+                      <div className="relative w-full aspect-[4/3] bg-[#09090B] rounded-2xl overflow-hidden border border-white/10">
+                        {/* Idle */}
+                        {!cameraActive && !capturedImage && (
+                          <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 p-6 text-center">
+                            <motion.div
+                              animate={{ scale: [1, 1.1, 1] }}
+                              transition={{ duration: 2, repeat: Infinity }}
+                              className="w-20 h-20 rounded-2xl border-2 border-[#C8FF00]/30 bg-[#C8FF00]/5 flex items-center justify-center"
+                            >
+                              <iconify-icon icon="lucide:camera" class="text-3xl text-[#C8FF00]" />
+                            </motion.div>
+                            <div>
+                              <p className="font-bold text-white mb-1">Ready to Scan</p>
+                              <p className="text-white/40 font-mono text-xs">
+                                Point your camera at a headline, article, or post
+                              </p>
+                            </div>
+                            <button
+                              onClick={startCamera}
+                              className="px-6 py-3 bg-[#C8FF00] text-[#09090B] font-bold text-xs uppercase tracking-widest rounded-xl hover:bg-white transition-colors flex items-center gap-2"
+                            >
+                              <iconify-icon icon="lucide:aperture" /> Start Camera
+                            </button>
+                            {cameraError && (
+                              <div className="mt-2 px-4 py-2 bg-red-500/10 border border-red-500/40 rounded-lg text-red-400 font-mono text-[10px]">
+                                {cameraError}
+                              </div>
+                            )}
                           </div>
-                          <p className="text-white/50 font-mono text-xs text-center px-4">Point your camera at a newspaper, article, or social media post</p>
-                          <button onClick={startCamera} className="px-6 py-2.5 bg-[#C8FF00] text-[#09090B] font-mono font-bold text-xs uppercase rounded-lg hover:bg-white transition-colors flex items-center gap-2">
-                            <iconify-icon icon="lucide:aperture" /> Open Camera
+                        )}
+
+                        {/* Live */}
+                        {cameraActive && (
+                          <>
+                            <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover" />
+                            {/* Scanner frame */}
+                            <div className="absolute inset-0 pointer-events-none">
+                              <div className="absolute top-5 left-5 w-10 h-10 border-t-2 border-l-2 border-[#C8FF00]" />
+                              <div className="absolute top-5 right-5 w-10 h-10 border-t-2 border-r-2 border-[#C8FF00]" />
+                              <div className="absolute bottom-5 left-5 w-10 h-10 border-b-2 border-l-2 border-[#C8FF00]" />
+                              <div className="absolute bottom-5 right-5 w-10 h-10 border-b-2 border-r-2 border-[#C8FF00]" />
+                              <motion.div
+                                className="absolute left-5 right-5 h-[2px] bg-[#C8FF00] shadow-[0_0_20px_5px_rgba(200,255,0,0.5)]"
+                                initial={{ top: '10%' }}
+                                animate={{ top: '90%' }}
+                                transition={{ duration: 2, repeat: Infinity, repeatType: 'reverse', ease: 'linear' }}
+                              />
+                              <div className="absolute top-4 left-1/2 -translate-x-1/2 flex items-center gap-2 bg-black/70 backdrop-blur-sm px-3 py-1 rounded-full border border-red-500/30">
+                                <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+                                <span className="font-mono text-[9px] text-white uppercase tracking-widest font-bold">Live</span>
+                              </div>
+                            </div>
+                          </>
+                        )}
+
+                        {/* Captured */}
+                        {capturedImage && (
+                          <>
+                            <img src={capturedImage} alt="Captured" className="w-full h-full object-cover" />
+                            {isExtracting && (
+                              <div className="absolute inset-0 bg-black/80 flex flex-col items-center justify-center gap-3">
+                                <div className="relative w-16 h-16">
+                                  <div className="absolute inset-0 border-2 border-[#C8FF00]/20 rounded-full" />
+                                  <div className="absolute inset-0 border-t-2 border-[#C8FF00] rounded-full animate-spin" />
+                                </div>
+                                <p className="font-mono text-[11px] text-[#C8FF00] font-bold tracking-widest">
+                                  EXTRACTING TEXT · {ocrProgress}%
+                                </p>
+                                <div className="w-48 h-1 bg-white/10 rounded-full overflow-hidden">
+                                  <motion.div
+                                    className="h-full bg-[#C8FF00]"
+                                    initial={{ width: '0%' }}
+                                    animate={{ width: `${ocrProgress}%` }}
+                                    transition={{ duration: 0.2 }}
+                                  />
+                                </div>
+                              </div>
+                            )}
+                          </>
+                        )}
+                      </div>
+
+                      {/* Camera controls */}
+                      {cameraActive && (
+                        <div className="flex gap-3">
+                          <button
+                            onClick={capturePhoto}
+                            className="flex-1 py-3 bg-[#C8FF00] text-[#09090B] font-bold uppercase text-sm rounded-xl hover:bg-white transition-colors flex items-center justify-center gap-2"
+                          >
+                            <iconify-icon icon="lucide:zap" class="text-lg" /> Capture & Analyze
+                          </button>
+                          <button
+                            onClick={stopCamera}
+                            className="px-4 py-3 bg-white/5 border border-white/10 text-white rounded-xl hover:bg-white/10 transition-colors"
+                          >
+                            <iconify-icon icon="lucide:x" class="text-lg" />
                           </button>
                         </div>
                       )}
-                      {cameraActive && (
-                        <>
-                          <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover" />
-                          <div className="absolute inset-0 pointer-events-none">
-                            <div className="absolute top-4 left-4 w-8 h-8 border-t-2 border-l-2 border-[#C8FF00]" />
-                            <div className="absolute top-4 right-4 w-8 h-8 border-t-2 border-r-2 border-[#C8FF00]" />
-                            <div className="absolute bottom-4 left-4 w-8 h-8 border-b-2 border-l-2 border-[#C8FF00]" />
-                            <div className="absolute bottom-4 right-4 w-8 h-8 border-b-2 border-r-2 border-[#C8FF00]" />
-                            <div className="absolute left-0 right-0 h-[2px] bg-gradient-to-r from-transparent via-[#C8FF00] to-transparent" style={{ animation: 'scanLineVert 2.5s ease-in-out infinite' }} />
-                            <div className="absolute top-4 left-1/2 -translate-x-1/2 flex items-center gap-2 bg-[#09090B]/70 backdrop-blur-sm px-3 py-1 rounded-full">
-                              <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
-                              <span className="font-mono text-[9px] text-white uppercase tracking-widest font-bold">Live</span>
-                            </div>
-                          </div>
-                        </>
+                      {capturedImage && !isExtracting && !isScanning && (
+                        <button
+                          onClick={retakePhoto}
+                          className="w-full py-2.5 bg-white/5 border border-white/10 text-white/80 rounded-xl hover:bg-white/10 transition-colors font-mono text-xs uppercase tracking-widest flex items-center justify-center gap-2"
+                        >
+                          <iconify-icon icon="lucide:refresh-cw" /> Retake Photo
+                        </button>
                       )}
-                      {capturedImage && <img src={capturedImage} alt="Captured" className="w-full h-full object-cover" />}
-                    </div>
-                    {cameraActive && (
-                      <div className="flex gap-3 mb-4">
-                        <button onClick={capturePhoto} className="flex-1 py-3 bg-[#C8FF00] text-[#09090B] font-display uppercase text-sm rounded-xl hover:bg-white transition-colors flex items-center justify-center gap-2">
-                          <iconify-icon icon="lucide:zap" class="text-lg" /> Capture & Analyze
+                    </motion.div>
+                  )}
+
+                  {/* Upload mode */}
+                  {mode === 'upload' && (
+                    <motion.div
+                      key="upload"
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      exit={{ opacity: 0 }}
+                      className="space-y-4"
+                    >
+                      <input ref={fileInputRef} type="file" accept="image/*" onChange={handleFileUpload} className="hidden" />
+                      {!capturedImage ? (
+                        <button
+                          onClick={() => fileInputRef.current?.click()}
+                          className="w-full border-2 border-dashed border-white/20 rounded-2xl py-16 bg-[#09090B] hover:border-[#C8FF00]/50 hover:bg-[#C8FF00]/5 transition-all flex flex-col items-center justify-center gap-3 group"
+                        >
+                          <iconify-icon icon="lucide:upload-cloud" class="text-4xl text-[#C8FF00] group-hover:-translate-y-1 transition-transform" />
+                          <div>
+                            <p className="font-bold text-white mb-1">Drop or Click to Upload</p>
+                            <p className="font-mono text-[10px] text-white/40">JPG, PNG, WEBP</p>
+                          </div>
                         </button>
-                        <button onClick={stopCamera} className="px-4 py-3 bg-white/10 border border-white/10 text-white rounded-xl hover:bg-white/20 transition-colors">
-                          <iconify-icon icon="lucide:x" class="text-lg" />
-                        </button>
+                      ) : (
+                        <div className="relative aspect-[4/3] bg-[#09090B] rounded-2xl overflow-hidden border border-white/10">
+                          <img src={capturedImage} alt="uploaded" className="w-full h-full object-cover" />
+                          {isExtracting && (
+                            <div className="absolute inset-0 bg-black/80 flex flex-col items-center justify-center gap-3">
+                              <div className="w-12 h-12 border-2 border-[#C8FF00]/20 border-t-[#C8FF00] rounded-full animate-spin" />
+                              <p className="font-mono text-[11px] text-[#C8FF00] font-bold tracking-widest">
+                                EXTRACTING · {ocrProgress}%
+                              </p>
+                            </div>
+                          )}
+                          <button
+                            onClick={resetScan}
+                            className="absolute top-3 right-3 w-8 h-8 bg-black/70 border border-white/20 rounded-full flex items-center justify-center hover:bg-red-500 hover:border-red-500"
+                          >
+                            <iconify-icon icon="lucide:x" class="text-white text-sm" />
+                          </button>
+                        </div>
+                      )}
+                    </motion.div>
+                  )}
+
+                  {/* URL mode */}
+                  {mode === 'url' && (
+                    <motion.div
+                      key="url"
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      exit={{ opacity: 0 }}
+                      className="space-y-4"
+                    >
+                      <div className="relative">
+                        <iconify-icon icon="lucide:link" class="absolute left-4 top-1/2 -translate-y-1/2 text-[#C8FF00] text-lg" />
+                        <input
+                          type="url"
+                          value={inputUrl}
+                          onChange={(e) => setInputUrl(e.target.value)}
+                          placeholder="https://example.com/article"
+                          className="w-full py-4 pl-12 pr-4 bg-[#09090B] border border-white/10 rounded-xl font-mono text-sm text-white placeholder:text-white/20 focus:outline-none focus:border-[#C8FF00] transition-colors"
+                        />
                       </div>
-                    )}
-                    {capturedImage && !isScanning && !result && (
-                      <button onClick={retakePhoto} className="mt-2 w-full py-2 bg-white/10 border border-white/10 text-white rounded-xl hover:bg-white/20 transition-colors font-mono text-xs uppercase flex items-center justify-center gap-2">
-                        <iconify-icon icon="lucide:refresh-cw" class="text-sm" /> Retake Photo
+                      <button
+                        onClick={runUrlScan}
+                        disabled={!inputUrl.trim() || isScanning}
+                        className="w-full py-3.5 bg-[#C8FF00] text-[#09090B] font-bold uppercase tracking-widest text-sm rounded-xl hover:bg-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex items-center justify-center gap-2"
+                      >
+                        <iconify-icon icon="lucide:radar" /> Analyze URL
                       </button>
-                    )}
-                  </div>
-                )}
-                {activeTab === 'file' && (
-                  <div className="flex-1 w-full border-2 border-dashed border-white/20 rounded-xl flex flex-col items-center justify-center p-8 min-h-[300px] hover:border-[#C8FF00]/50 transition-colors bg-[#09090B] relative group">
-                     <input type="file" accept=".txt,.pdf,.docx,.jpg,.jpeg,.png" onChange={handleFileChange} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" />
-                     <iconify-icon icon="lucide:file-up" class="text-4xl text-[#C8FF00] mb-4 group-hover:-translate-y-2 transition-transform" />
-                     <p className="font-bold mb-2">Drag & Drop or Click</p>
-                     <p className="font-mono text-xs text-white/50">Supports JPG, PNG, PDF, DOCX, TXT</p>
-                     {fileName && (
-                       <div className="mt-6 text-[#C8FF00] font-mono text-xs p-3 bg-[#C8FF00]/10 rounded border border-[#C8FF00]/30 text-center z-10 w-full overflow-hidden">
-                         File selected: <br/><strong className="truncate block mt-1">{fileName}</strong>
-                         {isExtracting && (
-                           <div className="mt-3 text-white/90 flex flex-col items-center justify-center gap-2">
-                             <div className="flex items-center gap-2 text-[#C8FF00]">
-                               <iconify-icon icon="lucide:scan" class="animate-pulse" /> SCANNING IMAGE...
-                             </div>
-                             <div className="w-full max-w-[150px] h-1 bg-white/20 rounded overflow-hidden">
-                               <div className="h-full bg-[#C8FF00] transition-all duration-300" style={{ width: `${ocrProgress}%` }} />
-                             </div>
-                             <span className="text-[10px] opacity-70">OCR Progress: {ocrProgress}%</span>
-                           </div>
-                         )}
-                         {capturedImage && !isExtracting && (
-                           <div className="mt-3 text-white flex flex-col items-center gap-2">
-                             <span className="bg-green-500/20 text-green-400 px-2 py-0.5 rounded border border-green-500/30 text-[9px] uppercase tracking-wider flex items-center gap-1">
-                               <iconify-icon icon="lucide:check-circle-2" /> Text extracted successfully
-                             </span>
-                             <button onClick={(e) => { e.preventDefault(); setFileName(''); setFileContent(''); setCapturedImage(null); }} className="mt-2 text-red-400 hover:text-red-300 underline decoration-red-400/30 text-[10px]">Remove Image</button>
-                           </div>
-                         )}
-                       </div>
-                     )}
-                     {capturedImage && (
-                       <div className="absolute inset-0 rounded-xl overflow-hidden pointer-events-none opacity-20 group-hover:opacity-10 transition-opacity">
-                         <img src={capturedImage} className="w-full h-full object-cover blur-sm" alt="Preview" />
-                       </div>
-                     )}
-                  </div>
-                )}
-                {activeTab === 'url' && (
-                  <div className="flex-1 flex flex-col gap-4 min-h-[300px]">
-                    <div className="flex items-center bg-[#09090B] border border-white/10 rounded-xl p-3 focus-within:border-[#C8FF00] transition-colors">
-                      <iconify-icon icon="lucide:link" class="text-[#C8FF00] ml-2 text-xl" />
-                      <input 
-                        type="url" 
-                        value={inputUrl}
-                        onChange={e => setInputUrl(e.target.value)}
-                        placeholder="https://example.com/news-article"
-                        className="w-full bg-transparent p-2 pl-4 font-mono text-sm text-white focus:outline-none"
-                      />
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+
+                {/* Extraction error */}
+                {extractionError && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="mt-4 p-4 bg-red-500/10 border-2 border-red-500/40 rounded-xl"
+                  >
+                    <div className="flex items-start gap-3">
+                      <iconify-icon icon="lucide:alert-octagon" class="text-red-400 text-xl shrink-0 mt-0.5" />
+                      <div className="flex-1">
+                        <p className="font-mono text-[10px] font-bold text-red-400 uppercase tracking-widest mb-1">
+                          Invalid Input
+                        </p>
+                        <p className="text-sm text-red-200 leading-relaxed">{extractionError}</p>
+                      </div>
                     </div>
-                    <div className="flex-1 border border-white/10 rounded-xl bg-[#09090B] flex items-center justify-center p-8 text-center border-dashed">
-                       <p className="text-white/30 font-mono text-xs leading-relaxed">
-                         <iconify-icon icon="lucide:globe" class="text-3xl block mx-auto mb-2 opacity-50" />
-                         URL Extractor Mode active.<br/>Paste a link above to scan public web content.
-                       </p>
+                    <button
+                      onClick={resetScan}
+                      className="mt-3 w-full py-2 bg-red-500/20 border border-red-500/40 text-red-200 font-mono text-xs uppercase tracking-widest rounded-lg hover:bg-red-500/30 transition-colors"
+                    >
+                      Try Again
+                    </button>
+                  </motion.div>
+                )}
+
+                {/* Extracted text preview */}
+                {extractedText && !extractionError && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="mt-4 p-4 bg-[#09090B] border border-[#C8FF00]/30 rounded-xl"
+                  >
+                    <div className="flex items-center justify-between mb-2">
+                      <p className="font-mono text-[10px] font-bold text-[#C8FF00] uppercase tracking-widest">
+                        Extracted Text
+                      </p>
+                      <span className="text-[9px] text-green-400 bg-green-500/10 border border-green-500/30 px-2 py-0.5 rounded flex items-center gap-1 font-mono">
+                        <iconify-icon icon="lucide:check-circle-2" /> VALID
+                      </span>
                     </div>
-                  </div>
+                    <p className="text-xs text-white/70 leading-relaxed max-h-24 overflow-y-auto font-mono">
+                      {extractedText.substring(0, 400)}
+                      {extractedText.length > 400 && '...'}
+                    </p>
+                  </motion.div>
                 )}
               </div>
+            </motion.div>
 
-              {activeTab !== 'camera' && (
-                <button 
-                  onClick={runAnalysis}
-                  disabled={isScanning || (activeTab === 'file' && !fileContent) || (activeTab === 'url' && !inputUrl)}
-                  className="w-full py-4 bg-[#C8FF00] text-[#09090B] font-display uppercase text-xl hover:bg-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex justify-center items-center gap-3 rounded-xl shadow-[0_0_20px_rgba(200,255,0,0.2)]"
-                >
-                  {isScanning ? (
-                    <><iconify-icon icon="lucide:loader-2" class="animate-spin text-2xl" /> SCANNING...</>
-                  ) : (
-                    <><iconify-icon icon="lucide:radar" class="text-2xl" /> INITIATE SCAN</>
-                  )}
-                </button>
-              )}
-            </div>
+            {/* ── RIGHT: Results ── */}
+            <motion.div
+              initial={{ opacity: 0, x: 20 }}
+              animate={{ opacity: 1, x: 0 }}
+              transition={{ delay: 0.25 }}
+              className="relative"
+            >
+              <AnimatePresence mode="wait">
+                {/* Idle state */}
+                {!isScanning && !isExtracting && !result && (
+                  <motion.div
+                    key="idle"
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                    className="bg-[#121212] border border-white/10 rounded-[24px] p-8 min-h-[560px] flex flex-col items-center justify-center text-center relative overflow-hidden"
+                  >
+                    <div className="absolute inset-0 opacity-[0.04]" style={{ backgroundImage: 'linear-gradient(#C8FF00 1px, transparent 1px), linear-gradient(90deg, #C8FF00 1px, transparent 1px)', backgroundSize: '24px 24px' }} />
+                    <motion.div
+                      animate={{ rotate: 360 }}
+                      transition={{ duration: 20, repeat: Infinity, ease: 'linear' }}
+                      className="w-32 h-32 rounded-full border-2 border-dashed border-[#C8FF00]/30 flex items-center justify-center mb-6"
+                    >
+                      <motion.div
+                        animate={{ scale: [1, 1.1, 1] }}
+                        transition={{ duration: 2, repeat: Infinity }}
+                      >
+                        <iconify-icon icon="lucide:shield-check" class="text-5xl text-[#C8FF00]" />
+                      </motion.div>
+                    </motion.div>
+                    <h3 className="font-display text-2xl uppercase tracking-tighter text-white mb-2">Awaiting Input</h3>
+                    <p className="font-mono text-xs text-white/40 max-w-sm">
+                      Capture a photo, upload an image, or paste a URL. The multi-model RAG pipeline will run automatically.
+                    </p>
 
-            {/* RIGHT COL: RESULT / LOADING */}
-            <div className="relative flex flex-col justify-center min-h-[400px]">
-              
-              {!isScanning && !result && (
-                <div className="relative bg-[#121212] border border-white/10 rounded-[24px] overflow-hidden h-full min-h-[560px] shadow-2xl">
-                  {/* Animated grid background */}
-                  <div className="absolute inset-0 opacity-[0.04]" style={{ backgroundImage: 'linear-gradient(#C8FF00 1px, transparent 1px), linear-gradient(90deg, #C8FF00 1px, transparent 1px)', backgroundSize: '24px 24px' }} />
-                  
-                  {/* Scan line sweeping vertically */}
-                  <div className="absolute left-0 right-0 h-[2px] bg-gradient-to-r from-transparent via-[#C8FF00]/40 to-transparent z-30" style={{ animation: 'scanLineVert 3s ease-in-out infinite' }} />
-
-                  {/* Top status bar */}
-                  <div className="relative z-20 flex items-center justify-between px-5 py-3 border-b border-white/5">
-                    <div className="flex items-center gap-2">
-                      <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
-                      <span className="font-mono text-[9px] text-red-400 uppercase tracking-[0.2em] font-bold">THREAT DETECTED</span>
-                    </div>
-                    <span className="font-mono text-[9px] text-white/30">SAMPLE_SCAN_001</span>
-                  </div>
-
-                  {/* Fake newspaper article card */}
-                  <div className="relative z-10 m-5 bg-[#1a1a1a] border border-white/10 rounded-xl p-6 overflow-hidden">
-                    {/* Article image placeholder */}
-                    <div className="w-full h-28 bg-gradient-to-br from-[#1e1e1e] to-[#2a2a2a] rounded-lg mb-4 flex items-center justify-center overflow-hidden relative">
-                      <div className="absolute inset-0 bg-[#09090B]/50" />
-                      <div className="grid grid-cols-3 gap-1 opacity-30 scale-110">
-                        {[...Array(6)].map((_, i) => <div key={i} className="w-12 h-8 bg-white/10 rounded" />)}
-                      </div>
-                      <div className="absolute top-2 left-2 bg-red-500/20 border border-red-500/40 px-2 py-0.5 rounded font-mono text-[8px] text-red-400 font-bold">UNVERIFIED SOURCE</div>
-                    </div>
-                    
-                    {/* Article text skeleton */}
-                    <div className="space-y-2 mb-3">
-                      <div className="h-4 bg-white/10 rounded w-[90%]" />
-                      <div className="h-4 bg-white/10 rounded w-full" />
-                      <div className="h-4 bg-white/10 rounded w-[75%]" />
-                    </div>
-                    <div className="space-y-1.5 mb-4">
-                      <div className="h-2.5 bg-white/5 rounded w-full" />
-                      <div className="h-2.5 bg-white/5 rounded w-[95%]" />
-                      <div className="h-2.5 bg-white/5 rounded w-[80%]" />
-                      <div className="h-2.5 bg-white/5 rounded w-[60%]" />
-                    </div>
-
-                    {/* Red flags inline */}
-                    <div className="flex flex-wrap gap-1.5">
-                      {['Emotional Language', 'Missing Sources', 'Clickbait'].map(f => (
-                        <span key={f} className="text-[9px] font-mono px-2 py-0.5 bg-red-500/10 text-red-400/80 border border-red-500/20 rounded">{f}</span>
+                    <div className="mt-8 grid grid-cols-3 gap-3 w-full max-w-sm">
+                      {[
+                        { label: 'SCANNED', val: '12.4K' },
+                        { label: 'FLAGGED', val: '3.8K' },
+                        { label: 'ACCURACY', val: '98%' },
+                      ].map((s) => (
+                        <div key={s.label} className="bg-[#09090B] border border-white/5 rounded-xl p-3 text-center">
+                          <div className="font-display text-lg text-[#C8FF00]">{s.val}</div>
+                          <div className="font-mono text-[8px] text-white/40 tracking-widest mt-0.5">{s.label}</div>
+                        </div>
                       ))}
                     </div>
-                  </div>
+                  </motion.div>
+                )}
 
-                  {/* ── FAKE RIBBONS ── */}
-                  {/* Ribbon 1 — top-left to bottom-right */}
-                  <div className="absolute z-20 top-[30%] -left-[15%] w-[140%] flex items-center justify-center" style={{ transform: 'rotate(-25deg)' }}>
-                    <div className="w-full bg-red-600 py-2 flex items-center justify-center gap-6 shadow-[0_4px_30px_rgba(239,68,68,0.4)]" style={{ animation: 'ribbonSlide 8s linear infinite' }}>
-                      {[...Array(8)].map((_, i) => (
-                        <span key={i} className="font-display text-white text-xl tracking-[0.3em] whitespace-nowrap select-none opacity-90">FAKE</span>
-                      ))}
-                    </div>
-                  </div>
-                  {/* Ribbon 2 — opposite diagonal */}
-                  <div className="absolute z-20 top-[55%] -left-[15%] w-[140%] flex items-center justify-center" style={{ transform: 'rotate(20deg)' }}>
-                    <div className="w-full bg-yellow-500/90 py-1.5 flex items-center justify-center gap-4 shadow-[0_4px_30px_rgba(234,179,8,0.3)]" style={{ animation: 'ribbonSlideReverse 10s linear infinite' }}>
-                      {[...Array(10)].map((_, i) => (
-                        <span key={i} className="font-mono text-[#09090B] text-xs font-bold tracking-[0.2em] whitespace-nowrap select-none">⚠ MISINFORMATION ⚠</span>
-                      ))}
-                    </div>
-                  </div>
-                  {/* Ribbon 3 — thin accent ribbon */}
-                  <div className="absolute z-20 top-[75%] -left-[10%] w-[130%]" style={{ transform: 'rotate(-15deg)' }}>
-                    <div className="w-full bg-red-500/80 py-1 flex items-center justify-center gap-5" style={{ animation: 'ribbonSlide 12s linear infinite' }}>
-                      {[...Array(12)].map((_, i) => (
-                        <span key={i} className="font-mono text-white/90 text-[9px] font-bold tracking-[0.15em] whitespace-nowrap select-none">DO NOT SHARE</span>
-                      ))}
-                    </div>
-                  </div>
-
-                  {/* Bottom stats bar */}
-                  <div className="absolute bottom-0 left-0 right-0 z-20 bg-[#09090B]/95 backdrop-blur-sm border-t border-white/5 px-5 py-4">
-                    <div className="flex items-center justify-between mb-3">
-                      <div className="flex items-center gap-2">
-                        <iconify-icon icon="lucide:radar" class="text-[#C8FF00] text-base animate-pulse" />
-                        <span className="font-mono text-[10px] text-[#C8FF00] tracking-widest font-bold uppercase">Veritas Engine Ready</span>
-                      </div>
-                      <div className="flex gap-1 items-end">
-                        {[3, 5, 2, 6, 4, 3, 5].map((h, i) => (
-                          <div key={i} className="w-1 rounded-full bg-[#C8FF00]/60" style={{ height: `${h * 3}px`, animation: 'pulse 1.5s ease-in-out infinite', animationDelay: `${i * 0.15}s` }} />
-                        ))}
+                {/* Scanning state */}
+                {(isScanning || isExtracting) && !result?.error && (
+                  <motion.div
+                    key="scanning"
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                    className="bg-[#121212] border border-[#C8FF00]/40 rounded-[24px] p-8 min-h-[560px] flex flex-col items-center justify-center shadow-[0_0_40px_rgba(200,255,0,0.1)]"
+                  >
+                    <div className="relative w-32 h-32 mb-8">
+                      <div className="absolute inset-0 border-2 border-white/10 rounded-full" />
+                      <motion.div
+                        className="absolute inset-0 border-t-2 border-r-2 border-[#C8FF00] rounded-full"
+                        animate={{ rotate: 360 }}
+                        transition={{ duration: 1.5, repeat: Infinity, ease: 'linear' }}
+                      />
+                      <motion.div
+                        className="absolute inset-3 border-b-2 border-l-2 border-white/20 rounded-full"
+                        animate={{ rotate: -360 }}
+                        transition={{ duration: 2.5, repeat: Infinity, ease: 'linear' }}
+                      />
+                      <div className="absolute inset-0 flex items-center justify-center">
+                        <iconify-icon icon="lucide:radar" class="text-4xl text-[#C8FF00] animate-pulse" />
                       </div>
                     </div>
+
+                    <div className="font-mono text-[#C8FF00] tracking-[0.3em] font-bold text-sm mb-2 uppercase">
+                      {isExtracting ? 'Extracting Text' : 'Running Pipeline'}
+                    </div>
+                    <div className="font-mono text-[10px] text-white/40 mb-6 uppercase tracking-widest">
+                      {activeStage ? PIPELINE_STAGES.find((s) => s.id === activeStage)?.label : 'Processing'}
+                    </div>
+
+                    <div className="w-full max-w-sm space-y-2">
+                      {PIPELINE_STAGES.map((stage, i) => {
+                        const isDone = completedStages.includes(stage.id)
+                        const isActive = activeStage === stage.id
+                        return (
+                          <div key={stage.id} className="flex items-center gap-3">
+                            <div className={`w-6 h-6 rounded-full flex items-center justify-center shrink-0 ${
+                              isActive
+                                ? 'bg-[#C8FF00] text-[#09090B]'
+                                : isDone
+                                  ? 'bg-[#C8FF00]/20 text-[#C8FF00]'
+                                  : 'bg-white/5 text-white/20'
+                            }`}>
+                              <iconify-icon icon={isDone ? 'lucide:check' : stage.icon} class="text-xs" />
+                            </div>
+                            <div className={`font-mono text-[10px] uppercase tracking-widest flex-1 ${
+                              isActive ? 'text-[#C8FF00] font-bold' : isDone ? 'text-white/60' : 'text-white/20'
+                            }`}>
+                              {stage.label}
+                            </div>
+                            {isActive && (
+                              <motion.div
+                                className="w-1 h-1 rounded-full bg-[#C8FF00]"
+                                animate={{ opacity: [0.3, 1, 0.3] }}
+                                transition={{ duration: 0.9, repeat: Infinity }}
+                              />
+                            )}
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </motion.div>
+                )}
+
+                {/* Error state (OCR / pipeline / validation) */}
+                {result?.error && (
+                  <motion.div
+                    key="error"
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0 }}
+                    className="bg-[#121212] border-2 border-red-500/40 rounded-[24px] p-8 min-h-[560px] flex flex-col items-center justify-center text-center"
+                  >
+                    <motion.div
+                      initial={{ scale: 0 }}
+                      animate={{ scale: 1 }}
+                      transition={{ type: 'spring', stiffness: 260, damping: 14 }}
+                      className="w-24 h-24 rounded-full bg-red-500/10 border-2 border-red-500/40 flex items-center justify-center mb-6"
+                    >
+                      <iconify-icon icon="lucide:alert-octagon" class="text-4xl text-red-400" />
+                    </motion.div>
+                    <h3 className="font-display text-3xl uppercase tracking-tighter text-red-400 mb-2">
+                      INVALID
+                    </h3>
+                    <p className="font-mono text-[10px] uppercase tracking-widest text-red-400/60 mb-4">
+                      {result.errorReason?.replace(/_/g, ' ')}
+                    </p>
+                    <p className="text-sm text-white/70 max-w-sm mb-6 leading-relaxed">
+                      {result.errorMessage}
+                    </p>
+
+                    {/* Tips based on reason */}
+                    <div className="bg-[#09090B] border border-white/10 rounded-xl p-4 mb-6 max-w-sm">
+                      <p className="font-mono text-[10px] uppercase tracking-widest text-[#C8FF00] mb-2">Tips</p>
+                      <ul className="text-xs text-white/60 space-y-1.5 text-left list-disc list-inside">
+                        <li>Ensure good lighting and steady framing</li>
+                        <li>Get closer to the text for a sharper image</li>
+                        <li>Avoid glare on screens or glossy surfaces</li>
+                        <li>Capture at least one full headline or paragraph</li>
+                      </ul>
+                    </div>
+
+                    <button
+                      onClick={resetScan}
+                      className="px-6 py-3 bg-[#C8FF00] text-[#09090B] font-bold uppercase text-xs tracking-widest rounded-xl hover:bg-white transition-colors flex items-center gap-2"
+                    >
+                      <iconify-icon icon="lucide:refresh-cw" /> Try Again
+                    </button>
+                  </motion.div>
+                )}
+
+                {/* Success result */}
+                {result && !result.error && (
+                  <motion.div
+                    key="result"
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0 }}
+                    className="bg-[#121212] border border-white/10 rounded-[24px] p-6 md:p-8 shadow-2xl space-y-5"
+                  >
+                    {/* Header */}
+                    <div className="flex justify-between items-start">
+                      <div>
+                        <span className="inline-block font-mono text-[9px] uppercase tracking-widest px-2 py-1 border border-[#C8FF00]/30 text-[#C8FF00] bg-[#C8FF00]/10 rounded mb-3">
+                          Analysis Complete
+                        </span>
+                        <h2 className="font-display text-3xl uppercase tracking-tighter text-white">
+                          CREDIBILITY REPORT
+                        </h2>
+                        {result.reasoningModel && (
+                          <p className="font-mono text-[10px] text-white/40 mt-1.5 tracking-wider">
+                            reasoned via {result.reasoningModel}
+                          </p>
+                        )}
+                      </div>
+
+                      {/* Score ring */}
+                      <div className="relative w-28 h-28 shrink-0">
+                        <svg className="w-full h-full transform -rotate-90">
+                          <circle cx="56" cy="56" r="48" stroke="rgba(255,255,255,0.08)" strokeWidth="8" fill="none" />
+                          <motion.circle
+                            cx="56"
+                            cy="56"
+                            r="48"
+                            stroke={getScoreColor(result.credibilityScore)}
+                            strokeWidth="8"
+                            fill="none"
+                            strokeLinecap="round"
+                            initial={{ strokeDashoffset: 301.6 }}
+                            animate={{ strokeDashoffset: 301.6 - (result.credibilityScore / 100) * 301.6 }}
+                            transition={{ duration: 1.2, ease: 'easeOut' }}
+                            strokeDasharray="301.6"
+                          />
+                        </svg>
+                        <div className="absolute inset-0 flex flex-col items-center justify-center">
+                          <span className="font-display text-3xl leading-none text-white">
+                            <Counter value={result.credibilityScore} />
+                          </span>
+                          <span className="text-[8px] font-mono text-white/40 uppercase tracking-widest mt-1">
+                            Credibility
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Risk + verdict row */}
+                    <div className={`p-4 rounded-xl border ${getRiskStyle(result.riskLevel).border} ${getRiskStyle(result.riskLevel).bg}`}>
+                      <div className="flex items-center gap-3">
+                        <iconify-icon
+                          icon={
+                            result.riskLevel === 'SAFE' ? 'lucide:shield-check' :
+                            result.riskLevel === 'HIGH RISK' ? 'lucide:shield-alert' :
+                            'lucide:shield'
+                          }
+                          class={`text-2xl ${getRiskStyle(result.riskLevel).text}`}
+                        />
+                        <div className="flex-1">
+                          <div className={`font-mono text-[9px] uppercase tracking-widest ${getRiskStyle(result.riskLevel).text}`}>
+                            Risk Level
+                          </div>
+                          <div className="font-bold text-lg text-white">
+                            {result.verdict} <span className="text-white/40 text-sm">· {result.riskLevel}</span>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Metrics row */}
                     <div className="grid grid-cols-3 gap-3">
                       {[
-                        { label: 'ARTICLES SCANNED', val: '12.4K' },
-                        { label: 'THREATS CAUGHT', val: '3,891' },
-                        { label: 'ACCURACY', val: '97.2%' },
-                      ].map(s => (
-                        <div key={s.label} className="text-center">
-                          <div className="font-display text-lg text-[#C8FF00]">{s.val}</div>
-                          <div className="font-mono text-[8px] text-white/40 tracking-widest">{s.label}</div>
-                        </div>
+                        { label: 'Fake Prob', value: `${result.fakeProbability}%` },
+                        { label: 'Manipulation', value: result.manipulationLevel },
+                        { label: 'Sentiment', value: result.sentiment },
+                      ].map((m, i) => (
+                        <motion.div
+                          key={m.label}
+                          initial={{ opacity: 0, y: 10 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          transition={{ delay: 0.1 + i * 0.05 }}
+                          className="bg-[#09090B] border border-white/5 rounded-xl p-3 text-center"
+                        >
+                          <p className="font-mono text-[8px] text-white/40 uppercase tracking-widest">{m.label}</p>
+                          <p className="text-sm font-bold text-white mt-1">{m.value}</p>
+                        </motion.div>
                       ))}
                     </div>
-                  </div>
 
-                  {/* CSS animations (inline style tag) */}
-                  <style>{`
-                    @keyframes scanLineVert {
-                      0% { top: 0; }
-                      50% { top: 100%; }
-                      100% { top: 0; }
-                    }
-                    @keyframes ribbonSlide {
-                      0% { transform: translateX(0); }
-                      100% { transform: translateX(-50%); }
-                    }
-                    @keyframes ribbonSlideReverse {
-                      0% { transform: translateX(-50%); }
-                      100% { transform: translateX(0); }
-                    }
-                  `}</style>
-                </div>
-              )}
-
-              {isScanning && (
-                <div className="flex flex-col items-center justify-center p-8 bg-[#121212] border border-[#C8FF00]/50 rounded-[24px] shadow-[0_0_40px_rgba(200,255,0,0.15)] h-full">
-                  <div className="relative flex items-center justify-center w-32 h-32 mb-8">
-                    <div className="absolute inset-0 border-2 border-white/10 rounded-full" />
-                    <div className="absolute inset-0 border-t-2 border-r-2 border-[#C8FF00] rounded-full animate-spin" style={{ animationDuration: '1.5s' }} />
-                    <iconify-icon icon="lucide:radar" class="text-4xl text-[#C8FF00] animate-pulse" />
-                  </div>
-                  <div className="font-mono text-[#C8FF00] tracking-[0.3em] font-bold text-sm mb-4">LIVE SCAN IN PROGRESS</div>
-                  <div className="w-full max-w-xs h-2 bg-white/10 rounded-full overflow-hidden">
-                    <div className="h-full bg-[#C8FF00] transition-all duration-300 relative" style={{ width: `${progress}%` }}>
-                       <div className="absolute top-0 right-0 bottom-0 left-0 bg-white/30 animate-pulse" />
-                    </div>
-                  </div>
-                  <div className="mt-4 font-mono text-xs text-white/50">{progress}% COMPLETE</div>
-                </div>
-              )}
-
-              {result && !isScanning && (
-                <div className="flex flex-col bg-[#121212] border border-white/20 rounded-[24px] p-6 md:p-8 animate-fade-in relative overflow-hidden shadow-2xl h-full">
-                  {/* Decorative background grid */}
-                  <div className="absolute inset-0 opacity-10" style={{ backgroundImage: 'radial-gradient(#C8FF00 1px, transparent 1px)', backgroundSize: '20px 20px' }} pointer-events-none="true" />
-                  
-                  <div className="flex justify-between items-start mb-8 relative z-10">
-                    <div>
-                      <div className="font-mono text-[10px] text-[#C8FF00] uppercase tracking-widest mb-1 border border-[#C8FF00]/30 inline-block px-2 py-0.5 rounded bg-[#C8FF00]/10">
-                        Analysis Complete
-                      </div>
-                      <h2 className="font-display text-3xl mt-2">CREDIBILITY REPORT</h2>
-                      {result.isImage && (
-                        <div className="flex gap-2 mt-2">
-                          <span className="bg-[#C8FF00]/20 text-[#C8FF00] border border-[#C8FF00]/50 font-mono text-[9px] uppercase tracking-widest px-2 py-0.5 rounded flex items-center gap-1">
-                            <iconify-icon icon="lucide:image" /> IMAGE ANALYSIS
-                          </span>
-                          <span className="bg-white/10 text-white/70 border border-white/20 font-mono text-[9px] uppercase tracking-widest px-2 py-0.5 rounded flex items-center gap-1">
-                            <iconify-icon icon="lucide:text-cursor-input" /> OCR EXTRACTED
-                          </span>
-                        </div>
-                      )}
-                    </div>
-                    
-                    {/* Animated Circular Gauge */}
-                    <div className="relative w-24 h-24 flex items-center justify-center shrink-0">
-                      <svg className="w-full h-full transform -rotate-90">
-                        <circle cx="48" cy="48" r={gaugeRadius} stroke="rgba(255,255,255,0.1)" strokeWidth="8" fill="none" />
-                        <circle 
-                          cx="48" cy="48" r={gaugeRadius} 
-                          stroke={result.score >= 70 ? '#C8FF00' : result.score >= 40 ? '#FBBF24' : '#EF4444'} 
-                          strokeWidth="8" fill="none" strokeDasharray={gaugeCircumference}
-                          strokeDashoffset={gaugeCircumference - (result.score / 100) * gaugeCircumference}
-                          className="transition-all duration-1000 ease-out drop-shadow-md"
-                        />
-                      </svg>
-                      <div className="absolute flex flex-col items-center">
-                        <span className="font-display text-3xl leading-none text-white">{result.score}</span>
-                        <span className="text-[9px] font-mono opacity-50 uppercase tracking-wider">Score</span>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-4 mb-8 relative z-10">
-                    <div className="bg-[#09090B] p-5 rounded-xl border border-white/5">
-                      <div className="flex justify-between font-mono text-[10px] uppercase mb-3">
-                        <span className="opacity-60">Source Trust</span>
-                        <span className="text-[#C8FF00] font-bold">{result.sourceTrust}%</span>
-                      </div>
-                      <div className="w-full h-2 bg-white/10 rounded-full overflow-hidden">
-                        <div className="h-full bg-[#C8FF00] transition-all duration-1000 delay-300 relative" style={{ width: `${result.sourceTrust}%` }}>
-                          <div className="absolute inset-0 bg-gradient-to-r from-transparent to-white/30" />
+                    {/* Layer breakdown */}
+                    {result.layerBreakdown && Object.keys(result.layerBreakdown).length > 0 && (
+                      <div className="bg-[#09090B] border border-white/5 rounded-xl p-4">
+                        <p className="font-mono text-[10px] text-[#C8FF00] uppercase tracking-widest mb-3 flex items-center gap-1.5">
+                          <iconify-icon icon="lucide:layers" /> Multi-Model Layer Breakdown
+                        </p>
+                        <div className="space-y-2.5">
+                          {Object.entries(result.layerBreakdown).map(([key, val], i) => (
+                            <div key={key} className="flex items-center gap-3">
+                              <span className="font-mono text-[10px] text-white/60 uppercase w-20 shrink-0 font-bold">
+                                {key}
+                              </span>
+                              <div className="flex-1 h-1.5 bg-white/10 rounded-full overflow-hidden">
+                                <motion.div
+                                  initial={{ width: 0 }}
+                                  animate={{ width: `${val.score || 0}%` }}
+                                  transition={{ duration: 0.8, delay: 0.2 + i * 0.1 }}
+                                  className={`h-full rounded-full ${
+                                    val.score >= 70 ? 'bg-[#C8FF00]' : val.score >= 40 ? 'bg-yellow-400' : 'bg-red-500'
+                                  }`}
+                                />
+                              </div>
+                              <span className="font-mono text-[10px] text-white/80 w-10 text-right font-bold">
+                                {val.score || 0}%
+                              </span>
+                            </div>
+                          ))}
                         </div>
                       </div>
-                    </div>
-                    <div className="bg-[#09090B] p-5 rounded-xl border border-white/5">
-                      <div className="flex justify-between font-mono text-[10px] uppercase mb-3">
-                        <span className="opacity-60">Factual Accuracy</span>
-                        <span className="text-[#C8FF00] font-bold">{result.factualAccuracy}%</span>
-                      </div>
-                      <div className="w-full h-2 bg-white/10 rounded-full overflow-hidden">
-                        <div className="h-full bg-[#C8FF00] transition-all duration-1000 delay-500 relative" style={{ width: `${result.factualAccuracy}%` }}>
-                           <div className="absolute inset-0 bg-gradient-to-r from-transparent to-white/30" />
+                    )}
+
+                    {/* RAG topics */}
+                    {result.retrievedTopics?.length > 0 && (
+                      <div className="bg-[#C8FF00]/5 border border-[#C8FF00]/30 rounded-xl p-4">
+                        <p className="font-mono text-[10px] text-[#C8FF00] uppercase tracking-widest mb-2 flex items-center gap-1.5">
+                          <iconify-icon icon="lucide:database" /> RAG Retrieved Context
+                        </p>
+                        <div className="flex flex-wrap gap-1.5">
+                          {result.retrievedTopics.map((t, i) => (
+                            <span
+                              key={i}
+                              className="text-[10px] font-mono px-2 py-0.5 bg-[#09090B] border border-[#C8FF00]/30 text-[#C8FF00] rounded-full font-bold"
+                            >
+                              {t}
+                            </span>
+                          ))}
                         </div>
                       </div>
-                    </div>
-                  </div>
+                    )}
 
-                  <div className="flex gap-4 mb-6 relative z-10">
-                    <div className="flex-1 bg-[#09090B] border border-white/5 p-4 rounded-xl flex items-center justify-between">
-                      <span className="font-mono text-[10px] uppercase opacity-60">Bias Level</span>
-                      <span className={`text-xs font-bold uppercase px-3 py-1 rounded bg-white/5 ${result.bias.toLowerCase() === 'low' ? 'text-green-400' : result.bias.toLowerCase() === 'high' ? 'text-red-400' : 'text-yellow-400'}`}>
-                        {result.bias}
-                      </span>
+                    {/* Explanation */}
+                    <div className="bg-[#09090B] border border-white/5 rounded-xl p-4">
+                      <p className="font-mono text-[10px] text-[#C8FF00] uppercase tracking-widest mb-2 flex items-center gap-1.5">
+                        <iconify-icon icon="lucide:bot" /> AI Summary
+                      </p>
+                      <p className="text-sm leading-relaxed text-white/80">{result.explanation}</p>
                     </div>
-                    <div className="flex-1 bg-[#09090B] border border-white/5 p-4 rounded-xl flex items-center justify-between">
-                      <span className="font-mono text-[10px] uppercase opacity-60">Manipulation</span>
-                      <span className={`text-xs font-bold uppercase px-3 py-1 rounded bg-white/5 ${result.manipulation ? 'text-red-400' : 'text-[#C8FF00]'}`}>
-                        {result.manipulation ? 'DETECTED' : 'CLEAR'}
-                      </span>
-                    </div>
-                  </div>
 
-                  <div className="bg-[#09090B] p-5 rounded-xl border border-white/5 mb-6 relative z-10">
-                    <div className="font-mono text-[10px] uppercase text-[#C8FF00] mb-2 flex items-center gap-2">
-                       <iconify-icon icon="lucide:bot" class="text-sm" /> AI Summary
-                    </div>
-                    <p className="text-sm leading-relaxed text-white/90">{result.summary}</p>
-                  </div>
-
-                  {result.isImage && result.extractedText && (
-                    <div className="bg-[#09090B] p-5 rounded-xl border border-white/5 mb-6 relative z-10">
-                      <div className="font-mono text-[10px] uppercase text-white/50 mb-2 flex items-center justify-between">
-                        <div className="flex items-center gap-2">
-                          <iconify-icon icon="lucide:file-text" class="text-sm" /> EXTRACTED TEXT PREVIEW
+                    {/* Flags */}
+                    {result.flags?.length > 0 && (
+                      <div>
+                        <p className="font-mono text-[10px] text-white/40 uppercase tracking-widest mb-2">Detected Flags</p>
+                        <div className="flex flex-wrap gap-1.5">
+                          {result.flags.map((f, i) => (
+                            <motion.span
+                              key={i}
+                              initial={{ opacity: 0, scale: 0.8 }}
+                              animate={{ opacity: 1, scale: 1 }}
+                              transition={{ delay: 0.3 + i * 0.05 }}
+                              className="text-[10px] font-mono px-2 py-1 bg-red-500/10 border border-red-500/30 text-red-400 rounded-full"
+                            >
+                              {f}
+                            </motion.span>
+                          ))}
                         </div>
-                        <span className="text-green-400 font-bold bg-green-500/10 px-2 py-0.5 rounded border border-green-500/20">OCR Confidence: High</span>
                       </div>
-                      <p className="text-xs leading-relaxed text-white/70 font-mono bg-white/5 p-3 rounded border border-white/10 max-h-32 overflow-y-auto whitespace-pre-wrap">{result.extractedText.length > 500 ? result.extractedText.substring(0, 500) + '...' : result.extractedText}</p>
+                    )}
+
+                    {/* Extracted text preview */}
+                    {result.extractedText && (
+                      <details className="bg-[#09090B] border border-white/5 rounded-xl p-4 cursor-pointer group">
+                        <summary className="font-mono text-[10px] text-white/40 uppercase tracking-widest flex items-center gap-2 cursor-pointer">
+                          <iconify-icon icon="lucide:file-text" />
+                          Extracted Text
+                          <iconify-icon icon="lucide:chevron-down" class="ml-auto group-open:rotate-180 transition-transform" />
+                        </summary>
+                        <p className="mt-3 text-xs font-mono text-white/60 leading-relaxed max-h-40 overflow-y-auto whitespace-pre-wrap">
+                          {result.extractedText.substring(0, 600)}
+                          {result.extractedText.length > 600 && '...'}
+                        </p>
+                      </details>
+                    )}
+
+                    {/* Actions */}
+                    <div className="flex gap-3 pt-2">
+                      <button
+                        onClick={() => navigator.clipboard.writeText(JSON.stringify(result, null, 2))}
+                        className="flex-1 py-3 bg-[#09090B] hover:bg-white/10 border border-white/10 rounded-xl text-[10px] font-mono font-bold uppercase tracking-widest transition-colors text-white flex items-center justify-center gap-1.5"
+                      >
+                        <iconify-icon icon="lucide:clipboard" /> Copy JSON
+                      </button>
+                      <button
+                        onClick={resetScan}
+                        className="flex-1 py-3 bg-[#C8FF00] text-[#09090B] hover:bg-white rounded-xl text-[10px] font-mono font-bold uppercase tracking-widest transition-colors flex items-center justify-center gap-1.5"
+                      >
+                        <iconify-icon icon="lucide:rotate-ccw" /> New Scan
+                      </button>
                     </div>
-                  )}
-
-                  {result.flags && result.flags.length > 0 && (
-                    <div className="mb-6 relative z-10">
-                       <div className="font-mono text-[10px] uppercase opacity-50 mb-3">Detected Flags</div>
-                       <div className="flex flex-wrap gap-2">
-                         {result.flags.map((flag, idx) => (
-                           <div key={idx} className="flex items-center gap-2 bg-red-500/10 border border-red-500/30 text-red-400 text-xs px-3 py-1.5 rounded-full font-medium transition-all hover:bg-red-500/20">
-                             <iconify-icon icon="lucide:alert-triangle" />
-                             {flag}
-                             <button onClick={() => removeFlag(idx)} className="ml-1 opacity-50 hover:opacity-100 transition-opacity"><iconify-icon icon="lucide:x" /></button>
-                           </div>
-                         ))}
-                       </div>
-                    </div>
-                  )}
-
-                  <div className="mt-auto flex gap-3 relative z-10 border-t border-white/10 pt-6">
-                    <button 
-                      onClick={() => { navigator.clipboard.writeText(JSON.stringify(result, null, 2)); alert('Report copied to clipboard!') }}
-                      className="flex-1 py-3 bg-[#09090B] hover:bg-white/10 border border-white/10 rounded-xl text-xs font-mono font-bold uppercase transition-colors text-white"
-                    >
-                      Copy Report
-                    </button>
-                    <button 
-                      onClick={() => setResult(null)}
-                      className="flex-1 py-3 bg-[#C8FF00] text-[#09090B] hover:bg-white rounded-xl text-xs font-mono font-bold uppercase transition-colors"
-                    >
-                      New Scan
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </motion.div>
           </div>
         </main>
       </div>

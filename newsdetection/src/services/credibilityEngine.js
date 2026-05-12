@@ -1,66 +1,43 @@
-/**
- * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * LAYER 4 — CREDIBILITY SCORING ENGINE
- * Purpose: Weighted aggregation of all AI layer outputs
- * into a unified credibility score and risk classification
- * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- */
-
-/**
- * Weight configuration for each AI layer.
- * These weights determine how much each model contributes to the final score.
- * Must sum to 1.0.
- */
 const WEIGHTS = {
-  fakeNewsClassifier: 0.40,
-  sentimentManipulation: 0.20,
-  llmReasoning: 0.20,
+  fakeNewsClassifier: 0.35,
+  sentimentManipulation: 0.15,
+  llmReasoning: 0.30,
   sourceReliability: 0.20,
 };
 
-/**
- * Risk level thresholds (based on final credibility score)
- */
 const RISK_THRESHOLDS = {
-  SAFE: 75,
+  SAFE: 70,
   MODERATE: 50,
-  SUSPICIOUS: 25,
-  // Below 25 = HIGH RISK
+  SUSPICIOUS: 30,
 };
 
-/**
- * Detects basic source reliability signals from the text.
- * This is a heuristic-based layer that checks for common
- * indicators of reliable vs unreliable content.
- *
- * @param {string} text - Original input text
- * @returns {{ score: number, signals: string[] }}
- */
 const analyzeSourceReliability = (text) => {
   const lowerText = text.toLowerCase();
-  let score = 50; // Start neutral
+  let score = 50;
   const signals = [];
 
-  // Positive signals (increase credibility)
   const positivePatterns = [
     { pattern: /according to|cited by|published by/i, label: "Attribution present", boost: 8 },
-    { pattern: /https?:\/\/[^\s]+/i, label: "Contains source URLs", boost: 5 },
-    { pattern: /study|research|data shows|statistics/i, label: "References data/research", boost: 7 },
-    { pattern: /reuters|ap news|associated press|bbc|nyt|washington post/i, label: "References major outlets", boost: 10 },
-    { pattern: /peer[- ]reviewed|journal|published in/i, label: "Academic references", boost: 10 },
-    { pattern: /official statement|press release|government/i, label: "Official source reference", boost: 6 },
+    { pattern: /https?:\/\/[^\s]+/i, label: "Contains source URLs", boost: 6 },
+    { pattern: /study|research|data shows|statistics|survey/i, label: "References data/research", boost: 8 },
+    { pattern: /reuters|ap news|associated press|bbc|nyt|washington post|guardian/i, label: "References major outlets", boost: 10 },
+    { pattern: /peer[- ]reviewed|journal|published in|university|institute/i, label: "Academic/institutional references", boost: 12 },
+    { pattern: /official statement|press release|government|senator|representative/i, label: "Official source reference", boost: 7 },
+    { pattern: /\d{4}-\d{2}-\d{2}|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]* \d{1,2},? \d{4}/i, label: "Contains publication date", boost: 5 },
+    { pattern: /[A-Z][a-z]+ [A-Z][a-z]+,? (?:PhD|MD|Dr\.|Professor|Prof\.)/i, label: "Quotes named expert", boost: 6 },
   ];
 
-  // Negative signals (decrease credibility)
   const negativePatterns = [
-    { pattern: /breaking|urgent|share before deleted|they don't want you to know/i, label: "Urgency/suppression tactics", penalty: 12 },
-    { pattern: /exposed|shocking|unbelievable|you won't believe/i, label: "Sensationalist language", penalty: 10 },
+    { pattern: /breaking|urgent|share before|they don't want you to know/i, label: "Urgency/suppression tactics", penalty: 12 },
+    { pattern: /exposed|shocking|unbelievable|you won't believe|mind.?blowing/i, label: "Sensationalist language", penalty: 10 },
     { pattern: /miracle|cure|secret|banned/i, label: "Miracle/conspiracy claims", penalty: 12 },
     { pattern: /wake up|sheeple|mainstream media lies|cover[- ]?up/i, label: "Conspiracy language", penalty: 15 },
-    { pattern: /!!!|[A-Z]{10,}/i, label: "Excessive emphasis", penalty: 8 },
-    { pattern: /forward this|share this now|must read/i, label: "Chain message tactics", penalty: 10 },
-    { pattern: /100% proven|guaranteed|undeniable/i, label: "Absolute claims", penalty: 8 },
-    { pattern: /deep state|big pharma|new world order/i, label: "Conspiracy theory markers", penalty: 15 },
+    { pattern: /!!!|[A-Z]{10,}/i, label: "Excessive emphasis signals", penalty: 8 },
+    { pattern: /forward this|share this now|must read|copy and paste/i, label: "Chain message tactics", penalty: 12 },
+    { pattern: /100% proven|guaranteed|undeniable|absolute fact/i, label: "Absolute claims", penalty: 8 },
+    { pattern: /deep state|big pharma|new world order|globalist|illuminati/i, label: "Conspiracy theory markers", penalty: 15 },
+    { pattern: /they are hiding|the truth about|what they don't want/i, label: "Secrecy narrative", penalty: 10 },
+    { pattern: /viral|trending|everyone is talking|spread the word/i, label: "Virality bait", penalty: 6 },
   ];
 
   positivePatterns.forEach(({ pattern, label, boost }) => {
@@ -77,31 +54,15 @@ const analyzeSourceReliability = (text) => {
     }
   });
 
-  // Clamp score
-  score = Math.max(0, Math.min(100, score));
-
-  return { score, signals };
+  return { score: Math.max(0, Math.min(100, score)), signals };
 };
 
-/**
- * Computes the final weighted credibility score and risk classification.
- *
- * @param {object} params
- * @param {string} params.text - Original user input
- * @param {object} params.classifierResult - Layer 1 output
- * @param {object} params.sentimentResult - Layer 2 output
- * @param {object} params.reasoningResult - Layer 3 output
- * @returns {{ credibilityScore: number, riskLevel: string, fakeProbability: number, sentiment: string, manipulationLevel: string, emotionalIntensity: number, explanation: string, verdict: string, flags: string[], sourceSignals: string[], layerBreakdown: object }}
- */
 export const computeCredibility = ({
   text,
   classifierResult = {},
   sentimentResult = {},
   reasoningResult = {},
 }) => {
-  // ── Layer 1 Score: Fake News Classifier ──
-  // If label is FAKE, the "credibility" from this layer is (100 - confidence)
-  // If label is REAL, the "credibility" is confidence directly
   const classLabel = classifierResult?.label?.toUpperCase() || "UNKNOWN";
   const classConfidence = classifierResult?.confidence || 0;
   const classifierCredibility =
@@ -109,30 +70,25 @@ export const computeCredibility = ({
       ? Math.max(0, 100 - classConfidence)
       : classLabel === "REAL"
       ? classConfidence
-      : 50; // Unknown → neutral
+      : 50;
 
-  // ── Layer 2 Score: Sentiment & Manipulation ──
-  // Low manipulation = high credibility, high manipulation = low credibility
   const manipLevel = sentimentResult?.manipulationLevel?.toLowerCase() || "unknown";
   let sentimentCredibility = 50;
   if (manipLevel === "low") sentimentCredibility = 85;
   else if (manipLevel === "low-moderate") sentimentCredibility = 65;
-  else if (manipLevel === "moderate") sentimentCredibility = 45;
+  else if (manipLevel === "moderate") sentimentCredibility = 40;
   else if (manipLevel === "high") sentimentCredibility = 15;
 
-  // ── Layer 3 Score: LLM Reasoning ──
   const reasoningConfidence = reasoningResult?.confidence || 50;
   const verdictStr = reasoningResult?.verdict?.toUpperCase() || "UNCERTAIN";
   let reasoningCredibility = reasoningConfidence;
-  // Adjust based on verdict
-  if (verdictStr.includes("VERIFIED")) reasoningCredibility = Math.max(reasoningCredibility, 80);
-  if (verdictStr.includes("SUSPICIOUS")) reasoningCredibility = Math.min(reasoningCredibility, 30);
-  if (verdictStr.includes("HIGHLY SUSPICIOUS")) reasoningCredibility = Math.min(reasoningCredibility, 15);
+  if (verdictStr.includes("VERIFIED")) reasoningCredibility = Math.max(reasoningCredibility, 85);
+  if (verdictStr.includes("SUSPICIOUS")) reasoningCredibility = Math.min(reasoningCredibility, 25);
+  if (verdictStr.includes("HIGHLY SUSPICIOUS")) reasoningCredibility = Math.min(reasoningCredibility, 10);
+  if (verdictStr.includes("MIXED SIGNALS")) reasoningCredibility = Math.min(reasoningCredibility, 55);
 
-  // ── Layer 4 Score: Source Reliability ──
   const sourceAnalysis = analyzeSourceReliability(text);
 
-  // ── WEIGHTED AGGREGATION ──
   const finalScore = Math.round(
     classifierCredibility * WEIGHTS.fakeNewsClassifier +
     sentimentCredibility * WEIGHTS.sentimentManipulation +
@@ -140,16 +96,13 @@ export const computeCredibility = ({
     sourceAnalysis.score * WEIGHTS.sourceReliability
   );
 
-  // Clamp
   const credibilityScore = Math.max(0, Math.min(100, finalScore));
 
-  // ── RISK LEVEL ──
   let riskLevel = "HIGH RISK";
   if (credibilityScore >= RISK_THRESHOLDS.SAFE) riskLevel = "SAFE";
   else if (credibilityScore >= RISK_THRESHOLDS.MODERATE) riskLevel = "MODERATE";
   else if (credibilityScore >= RISK_THRESHOLDS.SUSPICIOUS) riskLevel = "SUSPICIOUS";
 
-  // ── FAKE PROBABILITY ──
   const fakeProbability =
     classLabel === "FAKE"
       ? classConfidence
@@ -157,13 +110,10 @@ export const computeCredibility = ({
       ? 100 - classConfidence
       : 50;
 
-  // ── COMPILE FLAGS ──
   const allFlags = [...(reasoningResult?.flags || [])];
-  // Add source-based flags
   sourceAnalysis.signals
     .filter((s) => s.startsWith("✗"))
     .forEach((s) => allFlags.push(s.replace("✗ ", "")));
-  // Deduplicate
   const uniqueFlags = [...new Set(allFlags)];
 
   return {
@@ -173,6 +123,7 @@ export const computeCredibility = ({
     sentiment: sentimentResult?.sentiment || "Unknown",
     manipulationLevel: sentimentResult?.manipulationLevel || "Unknown",
     emotionalIntensity: sentimentResult?.emotionalIntensity || 0,
+    manipulationScore: sentimentResult?.manipulationScore || 0,
     explanation: reasoningResult?.explanation || "No explanation available.",
     verdict: reasoningResult?.verdict || "UNCERTAIN",
     flags: uniqueFlags,
