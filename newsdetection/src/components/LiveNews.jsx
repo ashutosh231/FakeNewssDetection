@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { analyzeNewsRaw } from '../services/huggingface'
+import { analyzeImageUrlRemote } from '../services/ocr'
 
 const EVENT_REGISTRY_API_KEY = "7b9d03bd-dca0-43b4-a1cc-7a3e39ff7256"
 const BASE_URL = "https://eventregistry.org/api/v1/article/getArticles"
@@ -447,7 +448,26 @@ export default function LiveNews() {
     // Prevent re-scanning if already done or in progress
     if (results[uri] || (stages[uri] && stages[uri] !== 'idle' && stages[uri] !== 'error')) return
 
-    const textToAnalyze = `${article.title}. ${article.body}`
+    // Silent enrichment: if the article has an image, ask DeepSeek-VL
+    // for OCR + contextual description and blend it into the text that
+    // feeds the RAG pipeline. This does not alter the UI, response
+    // shape, or loader flow — it simply gives the downstream
+    // classifiers richer grounding.
+    let imageContextText = ''
+    if (article.image) {
+      try {
+        const vl = await analyzeImageUrlRemote(article.image)
+        if (vl?.combinedText) imageContextText = vl.combinedText
+        else if (vl?.imageContext) imageContextText = `[Image context: ${vl.imageContext}]`
+      } catch {
+        /* ignore, pipeline works fine without it */
+      }
+    }
+
+    const baseText = `${article.title}. ${article.body}`
+    const textToAnalyze = imageContextText
+      ? `${baseText}\n\n${imageContextText}`
+      : baseText
 
     // Simulate pipeline stages for UX transparency while the real chain runs
     const stageOrder = ['retrieving', 'classifying', 'sentiment', 'reasoning', 'scoring']
