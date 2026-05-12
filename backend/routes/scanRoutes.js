@@ -30,12 +30,12 @@ router.post('/text', protect, checkUsageLimit, scanText);
 router.get('/history', protect, getScanHistory);
 
 // DeepSeek-VL image OCR + contextual understanding (additive).
-// /image requires auth (uploaded user content + quota semantics).
-// /image/url is intentionally public — it's used by the homepage
-// LiveNews live-scan section to silently enrich article thumbnails
-// (which are already public data) with contextual understanding.
-// Rate-limiting still applies via the global /api/ limiter.
-router.post('/image', protect, upload.single('image'), analyzeUploadedImage);
+// Both /image and /image/url are public — they only perform OCR text
+// extraction and contextual understanding, which doesn't consume a
+// user's scan quota. The actual quota-consuming action remains
+// POST /scan/text (which stays behind protect + checkUsageLimit).
+// Global rate limiter on /api/ still applies to prevent abuse.
+router.post('/image', upload.single('image'), analyzeUploadedImage);
 router.post('/image/url', analyzeRemoteImage);
 router.get('/image/:jobId', protect, getImageJobStatus);
 

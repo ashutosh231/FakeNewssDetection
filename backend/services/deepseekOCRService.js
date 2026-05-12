@@ -35,13 +35,33 @@ const { redisClient } = require('../config/redis');
 
 const HF_TOKEN = process.env.HF_TOKEN || process.env.VITE_HF_TOKEN;
 
-// Primary VL model as requested, with a short chain of multimodal
-// fallbacks. All are invoked via the HF Inference API so the same
-// token + endpoint style works.
-const VL_MODELS = [
-  'deepseek-ai/deepseek-vl2',
-  'deepseek-ai/deepseek-vl-7b-chat',
+// Model chain for multimodal OCR + image understanding via HF Inference API.
+// DeepSeek-VL2 is the ideal model but is gated/unavailable on the free
+// Inference API tier. We use a practical chain of models that ARE available:
+//
+// 1. microsoft/trocr-large-printed — dedicated OCR model (best for text extraction)
+// 2. Salesforce/blip-image-captioning-large — image captioning (context)
+// 3. nlpconnect/vit-gpt2-image-captioning — lightweight fallback captioning
+//
+// The service combines OCR output + captioning to produce both extracted
+// text AND contextual understanding of the image.
+
+const OCR_MODELS = [
+  'microsoft/trocr-large-printed',
+  'microsoft/trocr-base-printed',
+];
+
+const CAPTION_MODELS = [
   'Salesforce/blip-image-captioning-large',
+  'Salesforce/blip-image-captioning-base',
+  'nlpconnect/vit-gpt2-image-captioning',
+];
+
+// Document understanding models that can extract structured text from
+// full-page screenshots (not just single lines like TrOCR).
+const DOCUMENT_MODELS = [
+  'microsoft/Florence-2-large',
+  'naver-clova-ix/donut-base-finetuned-cord-v2',
 ];
 
 const HF_BASE = 'https://api-inference.huggingface.co/models';
@@ -64,8 +84,9 @@ const toBuffer = async (input) => {
       const comma = input.indexOf(',');
       return Buffer.from(input.slice(comma + 1), 'base64');
     }
-    if (/^[A-Za-z0-9+/=]+$/.test(input) && input.length > 100) {
-      return Buffer.from(input, 'base64');
+    // Check if it looks like base64 (at least 20 chars, valid charset)
+    if (/^[A-Za-z0-9+/\n\r]+=*$/.test(input.replace(/\s/g, '')) && input.length > 20) {
+      return Buffer.from(input.replace(/\s/g, ''), 'base64');
     }
     if (fs.existsSync(input)) {
       return fs.readFileSync(input);
@@ -126,14 +147,73 @@ const parseVLResponse = (raw) => {
   return { text: cleanExtracted(textBlob), context: '' };
 };
 
-// ── Inference call ────────────────────────────────────────────────
+// ── Inference calls ───────────────────────────────────────────────
 
-const callHFModel = async (model, imageBuffer) => {
-  // Strategy: models that accept JSON with { image, text } prompt vs.
-  // models that just accept a raw image body. Try JSON multimodal first,
-  // then fall back to binary body (for plain caption models like BLIP).
+/**
+ * Call an OCR model (TrOCR) — accepts raw image bytes, returns text.
+ */
+const callOCRModel = async (model, imageBuffer) => {
+  try {
+    const res = await fetch(`${HF_BASE}/${model}`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${HF_TOKEN}`,
+        'Content-Type': 'application/octet-stream',
+        Accept: 'application/json',
+      },
+      body: imageBuffer,
+      signal: AbortSignal.timeout(30000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    // TrOCR returns [{ generated_text: "..." }]
+    if (Array.isArray(data) && data[0]?.generated_text) {
+      return data[0].generated_text;
+    }
+    if (data?.generated_text) return data.generated_text;
+    if (typeof data === 'string') return data;
+    return null;
+  } catch {
+    return null;
+  }
+};
 
-  // Attempt 1: JSON multimodal body
+/**
+ * Call a captioning model (BLIP/ViT-GPT2) — accepts raw image bytes,
+ * returns a short description of what the image shows.
+ */
+const callCaptionModel = async (model, imageBuffer) => {
+  try {
+    const res = await fetch(`${HF_BASE}/${model}`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${HF_TOKEN}`,
+        'Content-Type': 'application/octet-stream',
+        Accept: 'application/json',
+      },
+      body: imageBuffer,
+      signal: AbortSignal.timeout(30000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    // BLIP returns [{ generated_text: "..." }]
+    if (Array.isArray(data) && data[0]?.generated_text) {
+      return data[0].generated_text;
+    }
+    if (data?.generated_text) return data.generated_text;
+    if (typeof data === 'string') return data;
+    return null;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Try the DeepSeek-VL chat-style API as a bonus attempt (if the model
+ * becomes available in the future). This is a best-effort call.
+ */
+const callDeepSeekVL = async (imageBuffer) => {
+  const model = 'deepseek-ai/deepseek-vl2';
   try {
     const res = await fetch(`${HF_BASE}/${model}`, {
       method: 'POST',
@@ -148,20 +228,53 @@ const callHFModel = async (model, imageBuffer) => {
           text: buildPrompt(),
         },
         parameters: { max_new_tokens: 512, temperature: 0.1 },
+        options: { wait_for_model: false },
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const parsed = parseVLResponse(data);
+    if (parsed.text || parsed.context) return parsed;
+    return null;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Call a document understanding model (Florence-2, Donut) that can
+ * handle full-page screenshots with multiple lines of text.
+ */
+const callDocumentModel = async (model, imageBuffer) => {
+  // Florence-2 uses a JSON body with task prompt
+  try {
+    const res = await fetch(`${HF_BASE}/${model}`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${HF_TOKEN}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({
+        inputs: imageBuffer.toString('base64'),
+        parameters: { task_prompt: '<OCR>' },
         options: { wait_for_model: true },
       }),
-      signal: AbortSignal.timeout(30000),
+      signal: AbortSignal.timeout(45000),
     });
     if (res.ok) {
       const data = await res.json();
-      const parsed = parseVLResponse(data);
-      if (parsed.text || parsed.context) return parsed;
+      // Florence-2 returns { generated_text: "..." } or [{ generated_text }]
+      let text = '';
+      if (Array.isArray(data) && data[0]?.generated_text) text = data[0].generated_text;
+      else if (data?.generated_text) text = data.generated_text;
+      else if (data?.[0]?.['<OCR>']) text = data[0]['<OCR>'];
+      if (text && text.trim().length > 5) return text.trim();
     }
-  } catch (err) {
-    /* try next shape */
-  }
+  } catch { /* try raw body */ }
 
-  // Attempt 2: raw image body (captioning models)
+  // Fallback: raw image body (Donut-style)
   try {
     const res = await fetch(`${HF_BASE}/${model}`, {
       method: 'POST',
@@ -171,16 +284,16 @@ const callHFModel = async (model, imageBuffer) => {
         Accept: 'application/json',
       },
       body: imageBuffer,
-      signal: AbortSignal.timeout(30000),
+      signal: AbortSignal.timeout(45000),
     });
     if (res.ok) {
       const data = await res.json();
-      const parsed = parseVLResponse(data);
-      if (parsed.text || parsed.context) return parsed;
+      let text = '';
+      if (Array.isArray(data) && data[0]?.generated_text) text = data[0].generated_text;
+      else if (data?.generated_text) text = data.generated_text;
+      if (text && text.trim().length > 5) return text.trim();
     }
-  } catch (err) {
-    /* swallow */
-  }
+  } catch { /* swallow */ }
 
   return null;
 };
@@ -240,39 +353,81 @@ const analyzeImage = async (imageInput, opts = {}) => {
     };
   }
 
-  // ── Model chain ──────────────────────────────────────────────
-  let parsed = null;
+  // ── Model chain (dual: OCR + captioning) ──────────────────────
+  let extractedText = '';
+  let imageContext = '';
   let modelUsed = null;
   const errors = [];
 
-  for (const model of VL_MODELS) {
-    try {
-      const result = await callHFModel(model, buffer);
-      if (result && (result.text || result.context)) {
-        parsed = result;
-        modelUsed = model;
-        break;
+  // Step 1: Try DeepSeek-VL first (best-effort, may not be available)
+  const deepseekResult = await callDeepSeekVL(buffer);
+  if (deepseekResult && (deepseekResult.text || deepseekResult.context)) {
+    extractedText = cleanExtracted(deepseekResult.text);
+    imageContext = (deepseekResult.context || '').trim();
+    modelUsed = 'deepseek-ai/deepseek-vl2';
+  }
+
+  // Step 2: If DeepSeek didn't produce OCR text, try document models
+  // (these handle full-page screenshots with multiple lines)
+  if (!extractedText) {
+    for (const model of DOCUMENT_MODELS) {
+      try {
+        const docText = await callDocumentModel(model, buffer);
+        if (docText && docText.trim().length > 10) {
+          extractedText = cleanExtracted(docText);
+          modelUsed = model;
+          break;
+        }
+      } catch (err) {
+        errors.push(`${model}: ${err.message}`);
       }
-    } catch (err) {
-      errors.push(`${model}: ${err.message}`);
     }
   }
 
-  if (!parsed) {
-    const fallback = {
+  // Step 3: If document models failed, try single-line OCR models
+  if (!extractedText) {
+    for (const model of OCR_MODELS) {
+      try {
+        const ocrText = await callOCRModel(model, buffer);
+        if (ocrText && ocrText.trim().length > 3) {
+          extractedText = cleanExtracted(ocrText);
+          modelUsed = model;
+          break;
+        }
+      } catch (err) {
+        errors.push(`${model}: ${err.message}`);
+      }
+    }
+  }
+
+  // Step 4: Get image context/caption (always try, enriches the pipeline)
+  if (!imageContext) {
+    for (const model of CAPTION_MODELS) {
+      try {
+        const caption = await callCaptionModel(model, buffer);
+        if (caption && caption.trim().length > 5) {
+          imageContext = caption.trim();
+          if (!modelUsed) modelUsed = model;
+          break;
+        }
+      } catch (err) {
+        errors.push(`${model}: ${err.message}`);
+      }
+    }
+  }
+
+  // If we got nothing at all, return fallback
+  if (!extractedText && !imageContext) {
+    return {
       extractedText: '',
       imageContext: '',
       combinedText: '',
       source: 'deepseek-vl-fallback',
       confidence: 0,
       cached: false,
-      error: errors.join(' | ') || 'All VL models unreachable',
+      error: errors.join(' | ') || 'All models returned empty results',
     };
-    return fallback;
   }
-
-  const extractedText = cleanExtracted(parsed.text);
-  const imageContext = (parsed.context || '').trim();
   const combinedText = [
     imageContext ? `[Image context: ${imageContext}]` : '',
     extractedText,

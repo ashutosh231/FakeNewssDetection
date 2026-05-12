@@ -72,7 +72,8 @@ const runDeepSeek = async (imageSource, onProgress) => {
   try {
     const res = await fetch(`${API_BASE}/scan/image`, {
       method: 'POST',
-      credentials: 'include',
+      // No credentials needed — endpoint is public (OCR extraction only,
+      // quota is enforced on the subsequent /scan/text call).
       body: form,
     });
     clearInterval(tick);
