@@ -2,18 +2,17 @@ import Tesseract from 'tesseract.js';
 
 /**
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * OCR service — DeepSeek-VL primary, Tesseract fallback
+ * OCR service — Qwen2.5-VL primary (via backend), Tesseract fallback
  *
  * Public API (unchanged):
  *   extractTextFromImage(imageSource, onProgress)
  *     → { text, confidence, context?, source, raw? }
  *
  * Internal flow:
- *   1. Attempt the backend DeepSeek-VL endpoint which runs OCR +
- *      multimodal context understanding via Hugging Face.
- *   2. If the backend is unreachable, unauthenticated, or returns an
- *      empty payload, fall back to Tesseract so the existing UX is
- *      never broken.
+ *   1. Attempt the backend /api/scan/image endpoint which runs
+ *      Qwen2.5-VL multimodal OCR + contextual understanding via HF.
+ *   2. If the backend is unreachable or returns empty, fall back to
+ *      client-side Tesseract so the existing UX is never broken.
  *
  * The extra fields (`context`, `source`, `raw`) are additive. All
  * existing callers that only read `text` + `confidence` continue to
@@ -42,60 +41,52 @@ const runTesseract = async (imageSource, onProgress) => {
   };
 };
 
-// ── DeepSeek-VL (primary) ────────────────────────────────────────
+// ── Qwen2.5-VL (primary via backend) ────────────────────────────
 const fileToBlob = async (src) => {
   if (src instanceof Blob) return src;
   if (src instanceof File) return src;
   if (typeof src === 'string') {
-    // data URL or remote URL -> fetch into a blob
     const res = await fetch(src);
     return await res.blob();
   }
-  throw new Error('Unsupported image input for DeepSeek upload');
+  throw new Error('Unsupported image input for upload');
 };
 
-const runDeepSeek = async (imageSource, onProgress) => {
+const runQwenVL = async (imageSource, onProgress) => {
   const form = new FormData();
   const blob = await fileToBlob(imageSource);
   form.append('image', blob, blob.name || 'upload.png');
 
-  // Soft progress while the request is in flight — the backend call is
-  // atomic so we can't stream real progress, but we keep the existing
-  // loaders lively.
+  // Soft progress while the request is in flight
   let pct = 5;
   if (onProgress) onProgress(pct);
   const tick = setInterval(() => {
-    pct = Math.min(85, pct + 7);
+    pct = Math.min(85, pct + 5);
     if (onProgress) onProgress(pct);
-  }, 400);
+  }, 500);
 
   try {
     const res = await fetch(`${API_BASE}/scan/image`, {
       method: 'POST',
-      // No credentials needed — endpoint is public (OCR extraction only,
-      // quota is enforced on the subsequent /scan/text call).
       body: form,
     });
     clearInterval(tick);
 
-    if (!res.ok) throw new Error(`DeepSeek OCR HTTP ${res.status}`);
+    if (!res.ok) throw new Error(`Qwen-VL OCR HTTP ${res.status}`);
 
     const payload = await res.json();
     const data = payload?.data || {};
 
     if (onProgress) onProgress(100);
 
-    // combinedText merges the OCR + multimodal context so the existing
-    // fake-news analysis pipeline receives richer grounding with no
-    // response-format changes required downstream.
     const text = data.combinedText || data.extractedText || '';
-    if (!text.trim()) throw new Error('DeepSeek returned empty text');
+    if (!text.trim()) throw new Error('Qwen-VL returned empty text');
 
     return {
       text,
       confidence: data.confidence ?? 70,
       context: data.imageContext || '',
-      source: data.source || 'deepseek-vl',
+      source: data.source || 'qwen-vl',
       raw: data,
     };
   } catch (err) {
@@ -105,21 +96,19 @@ const runDeepSeek = async (imageSource, onProgress) => {
 };
 
 /**
- * Extracts text from an image using DeepSeek-VL with Tesseract fallback.
+ * Extracts text from an image using Qwen2.5-VL with Tesseract fallback.
  *
  * @param {File|Blob|string} imageSource - File, Blob, data URL, or remote URL
  * @param {(pct: number) => void} [onProgress]
  * @returns {Promise<{text: string, confidence: number, context?: string, source: string, raw?: object}>}
  */
 export const extractTextFromImage = async (imageSource, onProgress) => {
-  // Primary: DeepSeek-VL via backend
+  // Primary: Qwen2.5-VL via backend
   try {
-    const result = await runDeepSeek(imageSource, onProgress);
+    const result = await runQwenVL(imageSource, onProgress);
     if (result?.text?.trim()) return result;
   } catch (err) {
-    // Swallow and fall back — the UX must not break when the backend
-    // is unreachable (e.g. anonymous user, no auth cookie, 401).
-    console.warn('[OCR] DeepSeek unavailable, falling back to Tesseract:', err?.message);
+    console.warn('[OCR] Qwen-VL unavailable, falling back to Tesseract:', err?.message);
   }
 
   // Fallback: Tesseract (existing behavior)
@@ -134,14 +123,13 @@ export const extractTextFromImage = async (imageSource, onProgress) => {
 /**
  * Lightweight helper for remote image URLs (used by the homepage
  * LiveNews section to enrich article thumbnails silently). Returns the
- * stable DeepSeek-VL payload or null on failure.
+ * Qwen2.5-VL payload or null on failure.
  */
 export const analyzeImageUrlRemote = async (imageUrl) => {
   if (!imageUrl) return null;
   try {
     const res = await fetch(`${API_BASE}/scan/image/url`, {
       method: 'POST',
-      credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ imageUrl }),
     });

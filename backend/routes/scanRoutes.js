@@ -29,7 +29,7 @@ const upload = multer({
 router.post('/text', protect, checkUsageLimit, scanText);
 router.get('/history', protect, getScanHistory);
 
-// DeepSeek-VL image OCR + contextual understanding (additive).
+// Qwen2.5-VL image OCR + contextual understanding (additive).
 // Both /image and /image/url are public — they only perform OCR text
 // extraction and contextual understanding, which doesn't consume a
 // user's scan quota. The actual quota-consuming action remains

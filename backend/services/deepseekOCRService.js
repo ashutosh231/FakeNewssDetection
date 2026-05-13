@@ -481,7 +481,13 @@ const analyzeImageUrl = async (url, opts = {}) => {
     };
   }
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(10000),
+      headers: {
+        'User-Agent': 'TruthScanAI/1.0 (Image Analysis)',
+        Accept: 'image/*',
+      },
+    });
     if (!res.ok) throw new Error(`Image fetch failed: ${res.status}`);
     const arrayBuf = await res.arrayBuffer();
     return analyzeImage(Buffer.from(arrayBuf), opts);
